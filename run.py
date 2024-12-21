@@ -150,5 +150,7 @@ frame_bottom.pack(pady=10)
 output_box = scrolledtext.ScrolledText(frame_bottom, width=90, height=25, bg="#4e4e4e", fg="white", insertbackground="white")
 output_box.pack()
 
+#testcommit
+
 # Chạy giao diện
 root.mainloop()
