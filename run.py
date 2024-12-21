@@ -37,6 +37,13 @@ def save_devices_to_file(devices):
             file.write(f"IP Address: {device['ip']}, MAC Address: {device['mac']}\n")
 
 def block_device(ip_address, mac_address, gateway_ip):
+    # Lấy thông tin IP và MAC của thiết bị hiện tại
+    my_ip = socket.gethostbyname(socket.gethostname())
+    my_mac = get_my_mac()
+
+    if ip_address == my_ip or mac_address == my_mac:
+        return "Không thể chặn chính thiết bị của bạn."
+
     gateway_mac = get_mac(gateway_ip)
     if not gateway_mac:
         return "Không tìm thấy địa chỉ MAC của gateway."
@@ -77,6 +84,14 @@ def get_mac(ip):
         return rcv[Ether].src
     return None
 
+def get_my_mac():
+    interfaces = psutil.net_if_addrs()
+    for interface in interfaces.values():
+        for addr in interface:
+            if addr.family == psutil.AF_LINK:
+                return addr.address
+    return None
+
 # Hàm xử lý giao diện
 
 def show_network_info():
@@ -103,8 +118,8 @@ def block():
     if not ip or not mac or not gateway_ip:
         messagebox.showwarning("Cảnh báo", "Hãy nhập đầy đủ địa chỉ IP, MAC và Gateway!")
         return
-    threading.Thread(target=block_device, args=(ip, mac, gateway_ip)).start()
-    messagebox.showinfo("Thông báo", f"Đã bắt đầu chặn thiết bị IP: {ip}, MAC: {mac}")
+    result = block_device(ip, mac, gateway_ip)
+    messagebox.showinfo("Thông báo", result)
 
 def unblock():
     result = unblock_devices()
@@ -149,8 +164,6 @@ frame_bottom.pack(pady=10)
 
 output_box = scrolledtext.ScrolledText(frame_bottom, width=90, height=25, bg="#4e4e4e", fg="white", insertbackground="white")
 output_box.pack()
-
-#testcommit
 
 # Chạy giao diện
 root.mainloop()
