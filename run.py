@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import messagebox, scrolledtext
+from tkinter import messagebox, simpledialog, scrolledtext
 import threading
 import scapy.all as scapy
 from scapy.layers.l2 import ARP, Ether, srp
@@ -52,7 +52,24 @@ def block_device(ip_address, mac_address, gateway_ip):
     return f"Đã chặn thiết bị với IP {ip_address} và MAC {mac_address}."
 
 def unblock_devices():
-    return "Tính năng bỏ chặn hiện chưa được triển khai."
+    devices = []
+    with open("network_devices.txt", "r") as file:
+        for line in file:
+            ip, mac = line.strip().split(', ')
+            ip_address = ip.split(': ')[1]
+            mac_address = mac.split(': ')[1]
+            devices.append((ip_address, mac_address))
+
+    for ip_address, mac_address in devices:
+        gateway_ip = "192.168.1.1"  # Replace with actual gateway IP
+        victim_mac = get_mac(ip_address)
+        gateway_mac = get_mac(gateway_ip)
+        if victim_mac and gateway_mac:
+            packet_victim = Ether(dst=victim_mac) / ARP(op=2, pdst=ip_address, psrc=gateway_ip, hwdst=victim_mac)
+            packet_gateway = Ether(dst=gateway_mac) / ARP(op=2, pdst=gateway_ip, psrc=ip_address, hwdst=gateway_mac)
+            sendp(packet_victim, verbose=0)
+            sendp(packet_gateway, verbose=0)
+    return "Đã bỏ chặn tất cả các thiết bị."
 
 def get_mac(ip):
     ans, _ = srp(Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=ip), timeout=2, verbose=0)
@@ -80,8 +97,8 @@ def scan():
     save_devices_to_file(devices)
 
 def block():
-    ip = ip_entry.get()
-    mac = mac_entry.get()
+    ip = simpledialog.askstring("Chặn thiết bị", "Nhập địa chỉ IP của thiết bị:")
+    mac = simpledialog.askstring("Chặn thiết bị", "Nhập địa chỉ MAC của thiết bị:")
     gateway_ip = gateway_entry.get()
     if not ip or not mac or not gateway_ip:
         messagebox.showwarning("Cảnh báo", "Hãy nhập đầy đủ địa chỉ IP, MAC và Gateway!")
@@ -123,13 +140,9 @@ tk.Label(frame_middle, text="Phạm vi IP:", bg="#2e2e2e", fg="white").grid(row=
 ip_entry = tk.Entry(frame_middle, width=30, bg="#4e4e4e", fg="white", insertbackground="white")
 ip_entry.grid(row=0, column=1, padx=5)
 
-tk.Label(frame_middle, text="Địa chỉ MAC:", bg="#2e2e2e", fg="white").grid(row=1, column=0, padx=5, sticky="w")
-mac_entry = tk.Entry(frame_middle, width=30, bg="#4e4e4e", fg="white", insertbackground="white")
-mac_entry.grid(row=1, column=1, padx=5)
-
-tk.Label(frame_middle, text="Gateway IP:", bg="#2e2e2e", fg="white").grid(row=2, column=0, padx=5, sticky="w")
+tk.Label(frame_middle, text="Gateway IP:", bg="#2e2e2e", fg="white").grid(row=1, column=0, padx=5, sticky="w")
 gateway_entry = tk.Entry(frame_middle, width=30, bg="#4e4e4e", fg="white", insertbackground="white")
-gateway_entry.grid(row=2, column=1, padx=5)
+gateway_entry.grid(row=1, column=1, padx=5)
 
 frame_bottom = tk.Frame(root, bg="#2e2e2e")
 frame_bottom.pack(pady=10)
