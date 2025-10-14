@@ -263,10 +263,20 @@ class NetworkToolGUI:
                                              height=35)
         self.btn_unblock_all.grid(row=1, column=1, sticky="ew", padx=5, pady=5)
 
-        # Status Indicator (Blocking and Bandwidth Monitor)
+        # --- MODIFICATION START ---
+        # New Ping Device button
+        self.btn_ping_device = ctk.CTkButton(action_buttons_frame, text="Ping Device",
+                                             command=self._start_ping_test_dialog,
+                                             fg_color=self.colors['accent'], hover_color=self.colors['accent_hover'],
+                                             height=35)
+        self.btn_ping_device.grid(row=2, column=0, sticky="ew", padx=5, pady=5)
+
+        # Status Indicator (Blocking and Bandwidth Monitor) - shifted to a new row
         self.blocking_status_label = ctk.CTkLabel(action_buttons_frame, text="Status: Idle",
                                                   text_color=self.colors['text_dim'])
-        self.blocking_status_label.grid(row=2, column=0, sticky="ew", padx=5, pady=5, columnspan=2)
+        self.blocking_status_label.grid(row=3, column=0, sticky="ew", padx=5, pady=5, columnspan=2)
+        # --- MODIFICATION END ---
+
 
         # Log Panel (now on the left, row 1, column 0)
         log_panel = ctk.CTkFrame(content_frame, fg_color=self.colors['card'], corner_radius=10)
@@ -346,6 +356,9 @@ class NetworkToolGUI:
         self.btn_scan.configure(state=state)
         self.ip_entry.configure(state=state)
         self.gateway_entry.configure(state=state)
+        # --- MODIFICATION START ---
+        self.btn_ping_device.configure(state=state) # Add ping button to general state management
+        # --- MODIFICATION END ---
 
         # Bandwidth monitor button state
         if not self.blocking_active and not busy and not self.bandwidth_monitor_active:
@@ -821,6 +834,77 @@ class NetworkToolGUI:
                 self.bandwidth_display_labels[ip_addr].configure(text=display_rate)
 
         self.bandwidth_update_job_id = self.root.after(self.bandwidth_monitor_interval_ms, self._update_bandwidth_gui)
+
+    # --- MODIFICATION START ---
+    def _start_ping_test_dialog(self):
+        """Prompts the user for an IP address to ping and starts the ping task."""
+        if self.blocking_active or self.bandwidth_monitor_active:
+            messagebox.showwarning("Cảnh báo", "Không thể chạy Ping Test khi đang chặn hoặc theo dõi băng thông.")
+            self.gui_log_output("Cannot start Ping Test while blocking or bandwidth monitoring is active.", "yellow")
+            return
+
+        ip_to_ping = simpledialog.askstring("Ping Device", "Nhập địa chỉ IP để ping:", parent=self.root)
+        if ip_to_ping:
+            # Basic IP validation
+            try:
+                socket.inet_aton(ip_to_ping) # Check if it's a valid IPv4 address
+            except socket.error:
+                messagebox.showerror("Lỗi", "Địa chỉ IP không hợp lệ!")
+                self.gui_log_output(f"Invalid IP address entered for ping: {ip_to_ping}", "red")
+                return
+
+            self._set_ui_busy_state(True)
+            self.gui_log_output(f"Starting ping test to {ip_to_ping}...", "blue")
+            threading.Thread(target=self.ping_test_task, args=(ip_to_ping,), daemon=True).start()
+
+    def ping_test_task(self, ip_address, count=4):
+        """Task to perform a series of pings and display results."""
+        successful_pings = 0
+        rtts = [] # Round Trip Times
+
+        self.gui_log_output(f"Pinging {ip_address} with {count} packets:", "blue")
+        logger.info(f"Initiating ping to {ip_address} with {count} packets.")
+
+        try:
+            for i in range(1, count + 1):
+                start_time = time.time()
+                # Use Scapy to send an ICMP echo request
+                # sr1 sends a packet and waits for the first answer
+                # timeout is in seconds
+                # verbose=0 suppresses Scapy's default output
+                ans = scapy.sr1(scapy.IP(dst=ip_address)/scapy.ICMP(), timeout=1, verbose=0)
+                end_time = time.time()
+
+                if ans:
+                    rtt_ms = (end_time - start_time) * 1000
+                    rtts.append(rtt_ms)
+                    successful_pings += 1
+                    self.gui_log_output(f"Reply from {ip_address}: bytes={len(ans)} time={rtt_ms:.2f}ms TTL={ans.ttl}", "green")
+                else:
+                    self.gui_log_output(f"Request timed out to {ip_address}", "red")
+                time.sleep(0.5) # Small delay between pings
+
+            # Summarize results
+            packet_loss = ((count - successful_pings) / count) * 100
+            self.gui_log_output("\n--- Ping Statistics ---", "blue")
+            self.gui_log_output(f"Packets: Sent = {count}, Received = {successful_pings}, Lost = {count - successful_pings} ({packet_loss:.0f}% loss)", "blue")
+
+            if rtts:
+                min_rtt = min(rtts)
+                max_rtt = max(rtts)
+                avg_rtt = sum(rtts) / len(rtts)
+                self.gui_log_output(f"Approximate round trip times in milli-seconds:", "blue")
+                self.gui_log_output(f"    Minimum = {min_rtt:.2f}ms, Maximum = {max_rtt:.2f}ms, Average = {avg_rtt:.2f}ms", "blue")
+            else:
+                self.gui_log_output("No successful replies received.", "red")
+
+        except Exception as e:
+            self.gui_log_output(f"Error during ping test: {e}", "red")
+            logger.error(f"Error during ping test to {ip_address}: {e}")
+        finally:
+            self.root.after(0, lambda: self._set_ui_busy_state(False))
+            self.gui_log_output(f"Ping test to {ip_address} completed.", "blue")
+    # --- MODIFICATION END ---
 
     def run(self):
         """Starts the main GUI event loop."""
