@@ -1,3 +1,0 @@
-IP Address: 192.168.1.2, MAC Address: 04:8d:39:36:51:bf
-IP Address: 192.168.1.3, MAC Address: 98:e7:43:06:d4:04
-IP Address: 192.168.1.4, MAC Address: bc:3e:cb:b4:97:37
