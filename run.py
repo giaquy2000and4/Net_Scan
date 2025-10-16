@@ -11,6 +11,8 @@ import os
 import logging
 from collections import defaultdict
 import ipaddress  # Added for CIDR calculation
+import serial  # Added for ESP32 connection
+import serial.tools.list_ports  # Added for listing serial ports
 
 # ---- Block environment variables that may cause PermissionError
 os.environ.pop("SSLKEYLOGFILE", None)
@@ -219,6 +221,14 @@ class NetworkToolGUI:
         self.bandwidth_monitor_interval_ms = 1000
         self.bandwidth_update_job_id = None
 
+        # State variables for ESP32 connection
+        self.esp32_connected = False
+        self.serial_port = None  # Holds the actual serial.Serial object
+        self.esp32_console_window = None
+        self.esp32_console_textbox = None
+        self.esp32_read_thread = None
+        self.esp32_baud_rate = 115200  # Fixed baud rate for simplicity
+
         # Local machine info
         self.my_ip = get_my_ip()
         self.my_mac = get_my_mac()
@@ -229,11 +239,16 @@ class NetworkToolGUI:
         self.interface_names = []  # List of names for the dropdown
         self.selected_interface_var = ctk.StringVar(value="Select an Interface")  # Default value for dropdown
 
+        # ESP32 Port Selection variables
+        self.esp32_port_names = []
+        self.selected_esp32_port_var = ctk.StringVar(value="Select ESP32 Port")  # Default for ESP32 dropdown
+
         self.main_container = ctk.CTkFrame(self.root, fg_color=self.colors['bg'])
         self.main_container.pack(fill="both", expand=True, padx=20, pady=20)
 
         self._setup_ui()
         self._populate_interface_dropdown()  # Initial population
+        self._populate_esp32_port_dropdown()  # Initial population for ESP32 ports
 
     def _setup_ui(self):
         """Sets up all the GUI widgets and layout."""
@@ -309,6 +324,26 @@ class NetworkToolGUI:
                                                       button_hover_color=self.colors['accent_hover'])
         self.interface_optionmenu.grid(row=2, column=1, sticky="ew", pady=5)
 
+        # ESP32 Port Selection
+        ctk.CTkLabel(input_frame, text="ESP32 Serial Port:", text_color=self.colors['text']).grid(row=3, column=0,
+                                                                                                  sticky="w",
+                                                                                                  padx=(0, 10),
+                                                                                                  pady=5)
+        self.esp32_port_optionmenu = ctk.CTkOptionMenu(input_frame,
+                                                       values=self.esp32_port_names,  # Will be populated
+                                                       variable=self.selected_esp32_port_var,
+                                                       fg_color=self.colors['bg'],
+                                                       button_color=self.colors['accent'],
+                                                       button_hover_color=self.colors['accent_hover'])
+        self.esp32_port_optionmenu.grid(row=3, column=1, sticky="ew", pady=5)
+
+        self.btn_refresh_esp32_ports = ctk.CTkButton(input_frame, text="Refresh ESP32 Ports",
+                                                     command=self._populate_esp32_port_dropdown,
+                                                     fg_color=self.colors['accent'],
+                                                     hover_color=self.colors['accent_hover'],
+                                                     height=35)
+        self.btn_refresh_esp32_ports.grid(row=4, column=1, sticky="ew", padx=0, pady=5)
+
         # Action Buttons Frame (right side of input_action_panel)
         action_buttons_frame = ctk.CTkFrame(input_action_panel, fg_color="transparent")
         action_buttons_frame.grid(row=0, column=1, sticky="nsew", padx=15, pady=15)
@@ -339,27 +374,33 @@ class NetworkToolGUI:
                                              height=35)
         self.btn_unblock_all.grid(row=1, column=1, sticky="ew", padx=5, pady=5)
 
-        # New Ping Device button - Adjusted row and column
+        # New Ping Device button
         self.btn_ping_device = ctk.CTkButton(action_buttons_frame, text="Ping Device",
                                              command=self._start_ping_test_dialog,
                                              fg_color=self.colors['accent'], hover_color=self.colors['accent_hover'],
                                              height=35)
-        self.btn_ping_device.grid(row=2, column=0, sticky="ew", padx=5, pady=5)  # Changed from row=3
+        self.btn_ping_device.grid(row=2, column=0, sticky="ew", padx=5, pady=5)
 
-        # New Refresh Interfaces button - Adjusted row and column
+        # New Refresh Interfaces button
         self.btn_refresh_interfaces = ctk.CTkButton(action_buttons_frame, text="Refresh Interfaces",
                                                     command=self._populate_interface_dropdown,
                                                     fg_color=self.colors['accent'],
                                                     hover_color=self.colors['accent_hover'],
                                                     height=35)
-        self.btn_refresh_interfaces.grid(row=2, column=1, sticky="ew", padx=5,
-                                         pady=5)  # Changed from row=2, column=1 to match Ping Device row
+        self.btn_refresh_interfaces.grid(row=2, column=1, sticky="ew", padx=5, pady=5)
 
-        # Status Indicator (Blocking and Bandwidth Monitor) - Adjusted row
+        # ESP32 Connect button
+        self.btn_esp32_connect = ctk.CTkButton(action_buttons_frame, text="Connect to ESP32",
+                                               command=self._start_esp32_connection,
+                                               fg_color=self.colors['accent'], hover_color=self.colors['accent_hover'],
+                                               height=35)
+        self.btn_esp32_connect.grid(row=3, column=0, sticky="ew", padx=5, pady=5)
+
+        # Status Indicator (Blocking and Bandwidth Monitor)
         self.blocking_status_label = ctk.CTkLabel(action_buttons_frame, text="Status: Idle",
                                                   text_color=self.colors['text_dim'])
-        self.blocking_status_label.grid(row=3, column=0, sticky="ew", padx=5, pady=5,
-                                        columnspan=2)  # Changed from row=4
+        self.blocking_status_label.grid(row=4, column=0, sticky="ew", padx=5, pady=5,
+                                        columnspan=2)
 
         # Log Panel (now on the left, row 1, column 0)
         log_panel = ctk.CTkFrame(content_frame, fg_color=self.colors['card'], corner_radius=10)
@@ -420,6 +461,30 @@ class NetworkToolGUI:
                 self.selected_interface_var.set(self.interface_names[0])
                 self.gui_log_output(f"Selected first available interface: {self.interface_names[0]}", "blue")
         self.interface_optionmenu.set(self.selected_interface_var.get())  # Ensure UI updates
+
+    def _populate_esp32_port_dropdown(self):
+        """Fetches available serial ports and populates the ESP32 port dropdown menu."""
+        ports = serial.tools.list_ports.comports()
+        self.esp32_port_names = [port.device for port in ports]
+
+        if not self.esp32_port_names:
+            self.esp32_port_names = ["No Ports Found"]
+            self.selected_esp32_port_var.set("No Ports Found")
+            self.gui_log_output("No serial ports found for ESP32 connection.", "warning")
+            logger.warning("No serial ports found to populate ESP32 dropdown.")
+        else:
+            self.esp32_port_optionmenu.configure(values=self.esp32_port_names)
+            # Try to keep the previously selected port if it's still available
+            if self.selected_esp32_port_var.get() not in self.esp32_port_names:
+                self.selected_esp32_port_var.set(self.esp32_port_names[0])
+                self.gui_log_output(f"Selected default ESP32 port: {self.esp32_port_names[0]}", "blue")
+            else:
+                self.gui_log_output(f"Refreshed ESP32 ports. Current selection: {self.selected_esp32_port_var.get()}",
+                                    "blue")
+
+        self.esp32_port_optionmenu.set(self.selected_esp32_port_var.get())  # Ensure UI updates
+        # Ensure the ESP32 connect button state is updated based on port availability
+        self._update_esp32_button_state(ui_busy=False)
 
     def _on_interface_selected(self, choice):
         """Callback for when an interface is selected from the dropdown."""
@@ -515,6 +580,10 @@ class NetworkToolGUI:
         else:
             self.btn_unblock_all.configure(state=state, text="Unblock All Devices", fg_color=self.colors['warning'],
                                            hover_color=self.colors['warning'])
+
+        # ESP32 Connect button state - crucial for fix
+        # Pass busy state to allow _update_esp32_button_state to decide 'normal' or 'disabled'
+        self.root.after(0, lambda: self._update_esp32_button_state(ui_busy=busy))
 
         self.root.update_idletasks()
 
@@ -889,6 +958,7 @@ class NetworkToolGUI:
                 self.gui_log_output("Cannot start bandwidth monitor: No devices scanned yet.", "yellow")
                 return
 
+            self._set_ui_busy_state(True)  # Temporarily set UI busy
             self.bandwidth_monitor_active = True
             self.btn_monitor_bandwidth.configure(text="Stop Bandwidth Monitor", fg_color=self.colors['error'],
                                                  hover_color=self.colors['error'])
@@ -903,12 +973,14 @@ class NetworkToolGUI:
             self.bandwidth_thread.start()
             self.bandwidth_update_job_id = self.root.after(self.bandwidth_monitor_interval_ms,
                                                            self._update_bandwidth_gui)
+            self._set_ui_busy_state(False)  # Release UI busy state, only bandwidth button remains changed
         else:
             self._stop_bandwidth_monitor_task()
 
     def _stop_bandwidth_monitor_task(self):
         """Stops the bandwidth monitoring thread and GUI updates."""
         if self.bandwidth_monitor_active:
+            self._set_ui_busy_state(True)  # Temporarily set UI busy
             self.bandwidth_monitor_active = False
             self.gui_log_output("Stopping bandwidth monitor...", "yellow")
             logger.info("Bandwidth monitor stopped.")
@@ -930,6 +1002,7 @@ class NetworkToolGUI:
 
             with self.bandwidth_lock:
                 self.current_bytes_per_ip.clear()
+            self._set_ui_busy_state(False)  # Release UI busy state
 
     def _bandwidth_sniff_task(self, interface):
         """
@@ -998,9 +1071,11 @@ class NetworkToolGUI:
 
     def _start_ping_test_dialog(self):
         """Prompts the user for an IP address to ping and starts the ping task."""
-        if self.blocking_active or self.bandwidth_monitor_active:
-            messagebox.showwarning("Cảnh báo", "Không thể chạy Ping Test khi đang chặn hoặc theo dõi băng thông.")
-            self.gui_log_output("Cannot start Ping Test while blocking or bandwidth monitoring is active.", "yellow")
+        if self.blocking_active or self.bandwidth_monitor_active or self.esp32_connected:
+            messagebox.showwarning("Cảnh báo",
+                                   "Không thể chạy Ping Test khi đang chặn, theo dõi băng thông hoặc kết nối ESP32.")
+            self.gui_log_output("Cannot start Ping Test while blocking, bandwidth monitoring or ESP32 is active.",
+                                "yellow")
             return
 
         selected_interface = self.selected_interface_var.get()
@@ -1075,6 +1150,199 @@ class NetworkToolGUI:
         finally:
             self.root.after(0, lambda: self._set_ui_busy_state(False))
             self.gui_log_output(f"Ping test to {ip_address} completed.", "blue")
+
+    # --- ESP32 Connection Functions ---
+    def _start_esp32_connection(self):
+        """Attempts to connect to ESP32 using the selected serial port and fixed baud rate."""
+        if self.blocking_active or self.bandwidth_monitor_active:
+            messagebox.showwarning("Cảnh báo",
+                                   "Không thể kết nối với ESP32 khi đang chặn hoặc theo dõi băng thông.")
+            self.gui_log_output("Cannot connect to ESP32 while blocking or bandwidth monitoring is active.", "yellow")
+            return
+
+        if self.esp32_connected:
+            self._stop_esp32_connection()  # If already connected, disconnect
+            return
+
+        selected_port = self.selected_esp32_port_var.get()
+        if selected_port == "Select ESP32 Port" or selected_port == "No Ports Found":
+            messagebox.showwarning("Cảnh báo", "Vui lòng chọn một cổng nối tiếp hợp lệ cho ESP32.")
+            self.gui_log_output("Cannot connect to ESP32: No valid serial port selected.", "yellow")
+            return
+
+        self._set_ui_busy_state(True)  # Disable other controls and ESP32 controls
+        # The ESP32 button itself will be updated by _update_esp32_button_state via _set_ui_busy_state
+        self.gui_log_output(f"Attempting to connect to ESP32 on {selected_port} at {self.esp32_baud_rate} baud...",
+                            "blue")
+        threading.Thread(target=self._esp32_connect_task, args=(selected_port, self.esp32_baud_rate,),
+                         daemon=True).start()
+
+    def _esp32_connect_task(self, port, baud_rate):
+        """Task to establish serial connection and open ESP32 console."""
+        try:
+            self.serial_port = serial.Serial(port, baud_rate, timeout=0.1)
+            self.esp32_connected = True
+            self.root.after(0, self._create_esp32_console_window)
+            self.gui_log_output(f"Successfully connected to ESP32 on {port}.", "green")
+            logger.info(f"Connected to ESP32 on {port} at {baud_rate} baud.")
+
+            # Start reading logs in a separate thread
+            self.esp32_read_thread = threading.Thread(target=self._esp32_read_log_task, daemon=True)
+            self.esp32_read_thread.start()
+
+        except serial.SerialException as e:
+            self.esp32_connected = False
+            if self.serial_port and self.serial_port.is_open:
+                self.serial_port.close()
+            self.serial_port = None
+            self.gui_log_output(f"Failed to connect to ESP32 on {port}: {e}", "red")
+            messagebox.showerror("Lỗi kết nối ESP32", f"Không thể kết nối với ESP32 trên {port}.\nLỗi: {e}")
+            logger.error(f"Serial connection error: {e}")
+        except Exception as e:
+            self.esp32_connected = False
+            if self.serial_port and self.serial_port.is_open:
+                self.serial_port.close()
+            self.serial_port = None
+            self.gui_log_output(f"An unexpected error occurred during ESP32 connection: {e}", "red")
+            messagebox.showerror("Lỗi", f"Lỗi không mong muốn: {e}")
+            logger.critical(f"Unexpected error during ESP32 connection: {e}")
+        finally:
+            # Crucial: Reset UI state after connection attempt, whether success or failure
+            self.root.after(0, lambda: self._set_ui_busy_state(False))
+
+    def _create_esp32_console_window(self):
+        """Creates a Toplevel window for displaying ESP32 logs."""
+        if self.esp32_console_window and self.esp32_console_window.winfo_exists():
+            self.esp32_console_window.lift()  # Bring to front if already open
+            return
+
+        self.esp32_console_window = ctk.CTkToplevel(self.root)
+        self.esp32_console_window.title(f"ESP32 Console - {self.serial_port.port}")
+        self.esp32_console_window.geometry("600x400")
+        self.esp32_console_window.protocol("WM_DELETE_WINDOW", self._stop_esp32_connection)  # Handle window close
+
+        frame = ctk.CTkFrame(self.esp32_console_window, fg_color=self.colors['card'])
+        frame.pack(fill="both", expand=True, padx=10, pady=10)
+        frame.grid_rowconfigure(0, weight=1)
+        frame.grid_columnconfigure(0, weight=1)
+
+        self.esp32_console_textbox = ctk.CTkTextbox(
+            frame,
+            fg_color=self.colors['bg'],
+            text_color=self.colors['text_dim'],
+            wrap="word",
+            state="disabled",
+            font=ctk.CTkFont(family="Consolas", size=10)
+        )
+        self.esp32_console_textbox.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
+
+        # Add a disconnect button to the console window itself
+        disconnect_btn = ctk.CTkButton(frame, text="Disconnect ESP32", command=self._stop_esp32_connection,
+                                       fg_color=self.colors['error'], hover_color=self.colors['error'])
+        disconnect_btn.grid(row=1, column=0, pady=(0, 10))
+
+        # Update the main GUI button (ensures it shows "Disconnect") - no need to call _set_ui_busy_state here again
+        self.root.after(0, lambda: self._update_esp32_button_state(ui_busy=False))
+
+    def _esp32_read_log_task(self):
+        """Continuously reads data from the serial port and appends it to the console textbox."""
+        while self.esp32_connected and self.serial_port and self.serial_port.is_open:
+            try:
+                if self.serial_port.in_waiting > 0:
+                    line = self.serial_port.readline().decode('utf-8', errors='ignore').strip()
+                    if line:
+                        self.root.after(0, lambda msg=line: self._append_esp32_log(msg))
+                time.sleep(0.05)  # Small delay to prevent busy-waiting
+            except serial.SerialException as e:
+                self.gui_log_output(f"Serial read error: {e}", "red")
+                logger.error(f"Serial read error for ESP32: {e}")
+                self.root.after(0, self._stop_esp32_connection)  # Ensure UI state is reset
+                break
+            except Exception as e:
+                self.gui_log_output(f"Unexpected error while reading from ESP32: {e}", "red")
+                logger.critical(f"Unexpected error while reading from ESP32: {e}")
+                self.root.after(0, self._stop_esp32_connection)  # Ensure UI state is reset
+                break
+
+    def _append_esp32_log(self, message: str):
+        """Appends a message to the ESP32 console textbox."""
+        if self.esp32_console_textbox and self.esp32_console_textbox.winfo_exists():
+            self.esp32_console_textbox.configure(state="normal")
+            self.esp32_console_textbox.insert("end", f"{message}\n")
+            self.esp32_console_textbox.see("end")
+            self.esp32_console_textbox.configure(state="disabled")
+
+    def _stop_esp32_connection(self):
+        """Closes the serial connection and cleans up the ESP32 console."""
+        if self.esp32_connected:
+            self.gui_log_output("Disconnecting from ESP32...", "yellow")
+            logger.info("Disconnecting from ESP32.")
+
+            # Set UI to busy state temporarily while disconnecting
+            self.root.after(0, lambda: self._set_ui_busy_state(True))
+
+            self.esp32_connected = False  # Signal read thread to stop
+
+            if self.serial_port and self.serial_port.is_open:
+                try:
+                    self.serial_port.close()
+                    self.gui_log_output("ESP32 serial port closed.", "green")
+                except Exception as e:
+                    self.gui_log_output(f"Error closing ESP32 serial port: {e}", "red")
+                    logger.error(f"Error closing ESP32 serial port: {e}")
+                self.serial_port = None
+
+            if self.esp32_read_thread and self.esp32_read_thread.is_alive():
+                self.esp32_read_thread.join(timeout=1)  # Give the thread a short moment to finish
+                if self.esp32_read_thread.is_alive():
+                    self.gui_log_output("ESP32 read thread did not terminate gracefully.", "red")
+                    logger.error("ESP32 read thread did not terminate gracefully.")
+                self.esp32_read_thread = None
+
+            if self.esp32_console_window and self.esp32_console_window.winfo_exists():
+                self.esp32_console_window.destroy()
+                self.esp32_console_window = None
+                self.esp32_console_textbox = None
+
+            # Ensure ESP32 button state is updated and UI busy state is reset
+            self.root.after(0, lambda: self._set_ui_busy_state(False))
+            self.gui_log_output("Disconnected from ESP32.", "green")
+        else:
+            # If not connected but somehow triggered, just ensure UI state is correct
+            self.root.after(0, lambda: self._set_ui_busy_state(False))
+
+    def _update_esp32_button_state(self, ui_busy: bool = False):
+        """
+        Updates the text, color, and state of the ESP32 connect button,
+        port dropdown, and refresh button based on connection status and overall UI busy state.
+        """
+        if ui_busy:
+            self.btn_esp32_connect.configure(state="disabled")
+            self.esp32_port_optionmenu.configure(state="disabled")
+            self.btn_refresh_esp32_ports.configure(state="disabled")
+        else:
+            if self.esp32_connected:
+                # When connected, show "Disconnect" and enable the button
+                self.btn_esp32_connect.configure(text="Disconnect ESP32", fg_color=self.colors['error'],
+                                                 hover_color=self.colors['error'], state="normal")
+                # Disable port selection and refresh when actively connected
+                self.esp32_port_optionmenu.configure(state="disabled")
+                self.btn_refresh_esp32_ports.configure(state="disabled")
+            else:
+                # When disconnected, show "Connect"
+                self.btn_esp32_connect.configure(text="Connect to ESP32", fg_color=self.colors['accent'],
+                                                 hover_color=self.colors['accent_hover'])
+
+                # Enable Connect button, port selection, and refresh button only if ports are found
+                if self.esp32_port_names and self.esp32_port_names[0] != "No Ports Found":
+                    self.btn_esp32_connect.configure(state="normal")
+                    self.esp32_port_optionmenu.configure(state="normal")
+                    self.btn_refresh_esp32_ports.configure(state="normal")
+                else:
+                    # No ports found, keep connect button and port dropdown disabled, but refresh is active
+                    self.btn_esp32_connect.configure(state="disabled")
+                    self.esp32_port_optionmenu.configure(state="disabled")
+                    self.btn_refresh_esp32_ports.configure(state="normal")  # Always allow refreshing ports
 
     def run(self):
         """Starts the main GUI event loop."""
