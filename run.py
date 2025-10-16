@@ -229,7 +229,6 @@ class NetworkToolGUI:
         self.interface_names = []  # List of names for the dropdown
         self.selected_interface_var = ctk.StringVar(value="Select an Interface")  # Default value for dropdown
 
-        # Main container
         self.main_container = ctk.CTkFrame(self.root, fg_color=self.colors['bg'])
         self.main_container.pack(fill="both", expand=True, padx=20, pady=20)
 
@@ -326,14 +325,6 @@ class NetworkToolGUI:
                                       height=35)
         self.btn_scan.grid(row=0, column=1, sticky="ew", padx=5, pady=5)
 
-        # New Refresh Interfaces button
-        self.btn_refresh_interfaces = ctk.CTkButton(action_buttons_frame, text="Refresh Interfaces",
-                                                    command=self._populate_interface_dropdown,
-                                                    fg_color=self.colors['accent'],
-                                                    hover_color=self.colors['accent_hover'],
-                                                    height=35)
-        self.btn_refresh_interfaces.grid(row=2, column=1, sticky="ew", padx=5, pady=5)
-
         self.btn_monitor_bandwidth = ctk.CTkButton(action_buttons_frame, text="Start Bandwidth Monitor",
                                                    command=self._start_stop_bandwidth_monitor,
                                                    fg_color=self.colors['success'],
@@ -348,17 +339,27 @@ class NetworkToolGUI:
                                              height=35)
         self.btn_unblock_all.grid(row=1, column=1, sticky="ew", padx=5, pady=5)
 
-        # New Ping Device button
+        # New Ping Device button - Adjusted row and column
         self.btn_ping_device = ctk.CTkButton(action_buttons_frame, text="Ping Device",
                                              command=self._start_ping_test_dialog,
                                              fg_color=self.colors['accent'], hover_color=self.colors['accent_hover'],
                                              height=35)
-        self.btn_ping_device.grid(row=3, column=0, sticky="ew", padx=5, pady=5)
+        self.btn_ping_device.grid(row=2, column=0, sticky="ew", padx=5, pady=5)  # Changed from row=3
 
-        # Status Indicator (Blocking and Bandwidth Monitor) - shifted to a new row
+        # New Refresh Interfaces button - Adjusted row and column
+        self.btn_refresh_interfaces = ctk.CTkButton(action_buttons_frame, text="Refresh Interfaces",
+                                                    command=self._populate_interface_dropdown,
+                                                    fg_color=self.colors['accent'],
+                                                    hover_color=self.colors['accent_hover'],
+                                                    height=35)
+        self.btn_refresh_interfaces.grid(row=2, column=1, sticky="ew", padx=5,
+                                         pady=5)  # Changed from row=2, column=1 to match Ping Device row
+
+        # Status Indicator (Blocking and Bandwidth Monitor) - Adjusted row
         self.blocking_status_label = ctk.CTkLabel(action_buttons_frame, text="Status: Idle",
                                                   text_color=self.colors['text_dim'])
-        self.blocking_status_label.grid(row=4, column=0, sticky="ew", padx=5, pady=5, columnspan=2)
+        self.blocking_status_label.grid(row=3, column=0, sticky="ew", padx=5, pady=5,
+                                        columnspan=2)  # Changed from row=4
 
         # Log Panel (now on the left, row 1, column 0)
         log_panel = ctk.CTkFrame(content_frame, fg_color=self.colors['card'], corner_radius=10)
