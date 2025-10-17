@@ -14,7 +14,7 @@ import ipaddress  # Added for CIDR calculation
 import serial  # Added for ESP32 connection
 import serial.tools.list_ports  # Added for listing serial ports
 
-# ---- Block environment variables that may cause PermissionError
+
 os.environ.pop("SSLKEYLOGFILE", None)
 
 try:
