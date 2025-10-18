@@ -12,7 +12,7 @@ import logging
 from collections import defaultdict
 import ipaddress  # Added for CIDR calculation
 import serial  # Added for ESP32 connection
-import serial.tools.list_ports  # Added for listing serial ports
+import serial.tools.list_ports  
 
 
 os.environ.pop("SSLKEYLOGFILE", None)
