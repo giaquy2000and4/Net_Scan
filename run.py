@@ -789,7 +789,7 @@ class NetworkToolGUI:
                 logger.error("Attempted to block own device.")
                 return
 
-            gateway_mac = get_mac(gateway_ip, iface=spoofing_interface)  # Pass interface to get_mac
+            gateway_mac = get_mac(gateway_ip, iface=spoofing_interface)  
             if not gateway_mac:
                 self.gui_log_output("Could not find MAC address of gateway. Blocking failed.", "red")
                 logger.error(
