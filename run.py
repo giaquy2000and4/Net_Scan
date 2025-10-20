@@ -131,7 +131,7 @@ def scan_network(ip_range, iface=None):
     arp = ARP(pdst=ip_range)
     ether = Ether(dst="ff:ff:ff:ff:ff:ff")  # Broadcast MAC
     packet = ether / arp
-    # srp sends and receives layer 2 packets, timeout in seconds, verbose=0 means no output to console
+    
     result = srp(packet, timeout=3, verbose=0, iface=iface)[0]  # Pass iface here
     devices = [{'ip': received.psrc, 'mac': received.hwsrc} for sent, received in result]
     return devices
