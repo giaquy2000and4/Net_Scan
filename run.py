@@ -1029,12 +1029,13 @@ class NetworkToolGUI:
     def scan_network_task(self, ip_range, scan_interface):
         """Task to scan the network and display results."""
         try:
+            self.scanned_devices = []  # <-- ĐÃ THÊM: Xóa danh sách thiết bị khi bắt đầu scan mới
             self.root.after(0, lambda: self.clear_device_list())
             self.gui_log_output(f"Starting ARP scan for {ip_range} on interface {scan_interface}...", "blue")
 
             self.root.after(0, lambda: self.scan_progress_bar.set(0.1))
 
-            devices = scan_network(ip_range, iface=scan_interface)  # Pass the interface to scan_network
+            devices = scan_network(ip_range, iface=scan_interface)
             self.scanned_devices = devices  # Store for block all
             self.gui_log_output(f"--- Found {len(devices)} Devices ---", "green")
             self.root.after(0, lambda: self.update_device_list(devices))
@@ -1060,7 +1061,8 @@ class NetworkToolGUI:
         self.scan_progress_bar.set(0)
         with self.bandwidth_lock:
             self.current_bytes_per_ip.clear()
-        self.scanned_devices = []  # Clear scanned devices too
+        # self.scanned_devices = []  # <-- ĐÃ BỎ: Không xóa danh sách dữ liệu ở đây
+                                    #     Chỉ xóa khi bắt đầu scan mới trong `scan_network_task`
 
     def update_device_list(self, devices):
         """Populates the devices_scroll_frame with scanned devices, including bandwidth labels and vendor info."""
@@ -1311,6 +1313,9 @@ class NetworkToolGUI:
             self.gui_log_output("Cannot start 'Block All': some blocking is already active.", "yellow")
             return
 
+        # <-- ĐÃ THÊM DEBUG LOG
+        self.gui_log_output(f"DEBUG: Checking scanned_devices for blocking. Current count: {len(self.scanned_devices)}", "blue")
+
         if not self.scanned_devices:
             messagebox.showwarning("Cảnh báo", "Hãy quét mạng trước để có các thiết bị cần chặn.")
             self.gui_log_output("Cannot start 'Block All': no devices have been scanned.", "yellow")
@@ -1338,6 +1343,9 @@ class NetworkToolGUI:
         for device in self.scanned_devices:
             if device['ip'] != my_ip and device['ip'] != gateway_ip:
                 devices_to_block.append(device)
+
+        # <-- ĐÃ THÊM DEBUG LOG
+        self.gui_log_output(f"DEBUG: Found {len(devices_to_block)} devices to block (excluding Host/Gateway).", "blue")
 
         if not devices_to_block:
             messagebox.showinfo("Thông báo", "Không tìm thấy thiết bị nào để chặn (ngoại trừ Host và Gateway).")
