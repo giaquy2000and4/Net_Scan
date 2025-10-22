@@ -14,7 +14,7 @@ if "SSLKEYLOGFILE" in os.environ:
 os.environ.pop("SSLKEYLOGFILE", None)  # Keep this original line, it's harmless if the above works
 
 import customtkinter as ctk
-from tkinter import messagebox, simpledialog
+from tkinter import messagebox # Removed simpledialog as it will be replaced
 import threading
 import scapy.all as scapy
 from scapy.layers.l2 import ARP, Ether, srp
@@ -241,6 +241,87 @@ def mac_lookup(mac_address, api_token):
     except Exception as e:
         return f"An unexpected error occurred: {e}"
 
+
+# NEW: Custom Ping Device Dialog
+class PingDeviceDialog(ctk.CTkToplevel):
+    def __init__(self, parent, colors, title="Ping Device", prompt="Nhập địa chỉ IP để ping:"):
+        super().__init__(parent)
+        self.parent = parent
+        self.colors = colors
+        self.title(title)
+        self.geometry("350x150") # Kích thước cửa sổ
+        self.resizable(False, False) # Không cho phép thay đổi kích thước
+        self.grab_set() # Làm cho cửa sổ modal (chặn tương tác với cửa sổ chính)
+        self.focus_force() # Đảm bảo cửa sổ có focus
+
+        self.ip_address = None # Biến để lưu trữ kết quả đầu vào
+
+        # Áp dụng màu nền cho cửa sổ dialog
+        self.configure(fg_color=self.colors['card'])
+
+        # Căn giữa cửa sổ dialog so với cửa sổ cha
+        self.update_idletasks() # Cập nhật geometry để lấy kích thước chính xác
+        parent_x = parent.winfo_x()
+        parent_y = parent.winfo_y()
+        parent_width = parent.winfo_width()
+        parent_height = parent.winfo_height()
+
+        self_width = self.winfo_width()
+        self_height = self.winfo_height()
+
+        x = parent_x + (parent_width // 2) - (self_width // 2)
+        y = parent_y + (parent_height // 2) - (self_height // 2)
+        self.geometry(f"+{x}+{y}")
+
+        # Label hiển thị thông báo
+        self.label = ctk.CTkLabel(self, text=prompt, text_color=self.colors['text'])
+        self.label.pack(pady=(20, 10))
+
+        # Entry để nhập địa chỉ IP
+        self.ip_entry = ctk.CTkEntry(self, width=250, fg_color=self.colors['bg'],
+                                     border_color=self.colors['accent'], text_color=self.colors['text'],
+                                     placeholder_text="e.g., 192.168.1.1")
+        self.ip_entry.pack(pady=(0, 20))
+        self.ip_entry.focus_set() # Đặt focus vào ô nhập liệu
+
+        # Khung chứa các nút OK và Cancel
+        button_frame = ctk.CTkFrame(self, fg_color="transparent")
+        button_frame.pack(pady=(0, 10))
+        button_frame.grid_columnconfigure((0, 1), weight=1) # Cân bằng 2 cột
+
+        self.ok_button = ctk.CTkButton(button_frame, text="OK", command=self._on_ok,
+                                       fg_color=self.colors['accent'], hover_color=self.colors['accent_hover'],
+                                       text_color=self.colors['bg'], width=100)
+        self.ok_button.grid(row=0, column=0, padx=10)
+
+        self.cancel_button = ctk.CTkButton(button_frame, text="Cancel", command=self._on_cancel,
+                                           fg_color=self.colors['bg'], border_color=self.colors['text_dim'],
+                                           border_width=1, text_color=self.colors['text'],
+                                           hover_color=self.colors['card'], width=100)
+        self.cancel_button.grid(row=0, column=1, padx=10)
+
+        # Ràng buộc các sự kiện phím
+        self.bind("<Return>", self._on_ok) # Nhấn Enter sẽ gọi _on_ok
+        self.bind("<Escape>", self._on_cancel) # Nhấn Esc sẽ gọi _on_cancel
+        self.protocol("WM_DELETE_WINDOW", self._on_cancel) # Xử lý khi đóng cửa sổ bằng nút X
+
+    def _on_ok(self, event=None):
+        """Xử lý khi nút OK được nhấn hoặc phím Enter được nhấn."""
+        self.ip_address = self.ip_entry.get().strip()
+        self.destroy() # Đóng cửa sổ dialog
+
+    def _on_cancel(self, event=None):
+        """Xử lý khi nút Cancel được nhấn hoặc phím Esc được nhấn/cửa sổ bị đóng."""
+        self.ip_address = None # Không có giá trị được trả về
+        self.destroy() # Đóng cửa sổ dialog
+
+    def get_input(self):
+        """
+        Hiển thị dialog và chờ người dùng nhập liệu.
+        Trả về địa chỉ IP đã nhập hoặc None nếu hủy.
+        """
+        self.parent.wait_window(self) # Chờ cho đến khi cửa sổ dialog bị đóng
+        return self.ip_address
 
 # ====== GUI Class ======
 class NetworkToolGUI:
@@ -1672,7 +1753,10 @@ class NetworkToolGUI:
             self.gui_log_output("Cannot start Ping Test: No valid interface selected.", "yellow")
             return
 
-        ip_to_ping = simpledialog.askstring("Ping Device", "Nhập địa chỉ IP để ping:", parent=self.root)
+        # NEW: Sử dụng custom PingDeviceDialog thay vì simpledialog.askstring
+        ping_dialog = PingDeviceDialog(self.root, self.colors)
+        ip_to_ping = ping_dialog.get_input() # Chờ dialog đóng và lấy giá trị
+
         if ip_to_ping:
             # Basic IP validation
             try:
