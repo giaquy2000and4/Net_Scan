@@ -185,22 +185,22 @@ def get_my_ip_global():
 class NetworkToolGUI:
     def __init__(self):
         ctk.set_appearance_mode("dark")
-        ctk.set_default_color_theme("dark-blue")
+        # ctk.set_default_color_theme("dark-blue") # Removed default theme
 
         self.root = ctk.CTk()
         self.root.title("Network Monitor")
         self.root.geometry("1250x700")
         self.root.minsize(1000, 600)
 
-        # Colors (Black-Gray theme inspired by EBS-Tool-Pack style)
+        # Colors (Dark-Green Neon theme)
         self.colors = {
-            'bg': '#1a1a1a',  # Darkest background
-            'card': '#252525',  # Slightly lighter for panels/cards
-            'accent': '#6495ed',  # Cornflower Blue for accent
-            'accent_hover': '#527fcf',  # Darker Cornflower Blue for hover
-            'text': '#f0f0f0',  # Light text
-            'text_dim': '#aaaaaa',  # Dimmed text
-            'success': '#32cd32',  # Lime Green for success
+            'bg': '#0d0d0d',  # Very dark background (black-like)
+            'card': '#1a1a1a',  # Slightly lighter for panels/cards (dark gray)
+            'accent': '#39FF14',  # Neon Green
+            'accent_hover': '#52FF34',  # Brighter Neon Green for hover effects
+            'text': '#ffffff',  # White text
+            'text_dim': '#bbbbbb',  # Dimmed white text
+            'success': '#39FF14',  # Use Neon Green for success
             'warning': '#ffd700',  # Gold for warning
             'error': '#dc143c',  # Crimson for error
         }
@@ -295,7 +295,7 @@ class NetworkToolGUI:
                                                                                                                 pady=5)
         self.ip_entry = ctk.CTkEntry(input_frame,
                                      placeholder_text="Enter IP range for scanning (optional if interface selected)",
-                                     fg_color=self.colors['bg'], border_color=self.colors['accent'])
+                                     fg_color=self.colors['bg'], border_color=self.colors['accent'], text_color=self.colors['text'])
         self.ip_entry.grid(row=0, column=1, sticky="ew", pady=5)
 
         ctk.CTkLabel(input_frame, text="Gateway IP (e.g., 192.168.1.1):", text_color=self.colors['text']).grid(row=1,
@@ -306,7 +306,7 @@ class NetworkToolGUI:
                                                                                                                    10),
                                                                                                                pady=5)
         self.gateway_entry = ctk.CTkEntry(input_frame, placeholder_text="Enter Gateway IP for blocking",
-                                          fg_color=self.colors['bg'], border_color=self.colors['accent'])
+                                          fg_color=self.colors['bg'], border_color=self.colors['accent'], text_color=self.colors['text'])
         self.gateway_entry.grid(row=1, column=1, sticky="ew", pady=5)
 
         # Interface Selection
@@ -318,9 +318,10 @@ class NetworkToolGUI:
                                                       values=self.interface_names,
                                                       variable=self.selected_interface_var,
                                                       command=self._on_interface_selected,
-                                                      fg_color=self.colors['bg'],
-                                                      button_color=self.colors['accent'],
-                                                      button_hover_color=self.colors['accent_hover'])
+                                                      fg_color=self.colors['bg'], # Background of the dropdown list
+                                                      button_color=self.colors['accent'], # Background of the selected item / dropdown button
+                                                      button_hover_color=self.colors['accent_hover'],
+                                                      text_color=self.colors['text'])
         self.interface_optionmenu.grid(row=2, column=1, sticky="ew", pady=5)
 
         # ESP32 Port Selection
@@ -331,15 +332,19 @@ class NetworkToolGUI:
         self.esp32_port_optionmenu = ctk.CTkOptionMenu(input_frame,
                                                        values=self.esp32_port_names,  # Will be populated
                                                        variable=self.selected_esp32_port_var,
-                                                       fg_color=self.colors['bg'],
-                                                       button_color=self.colors['accent'],
-                                                       button_hover_color=self.colors['accent_hover'])
+                                                       fg_color=self.colors['bg'], # Background of the dropdown list
+                                                       button_color=self.colors['accent'], # Background of the selected item / dropdown button
+                                                       button_hover_color=self.colors['accent_hover'],
+                                                       text_color=self.colors['text'])
         self.esp32_port_optionmenu.grid(row=3, column=1, sticky="ew", pady=5)
 
         self.btn_refresh_esp32_ports = ctk.CTkButton(input_frame, text="Refresh ESP32 Ports",
                                                      command=self._populate_esp32_port_dropdown,
-                                                     fg_color=self.colors['accent'],
-                                                     hover_color=self.colors['accent_hover'],
+                                                     fg_color=self.colors['bg'],
+                                                     border_color=self.colors['accent'],
+                                                     border_width=2,
+                                                     text_color=self.colors['text'],
+                                                     hover_color=self.colors['card'],
                                                      height=35)
         self.btn_refresh_esp32_ports.grid(row=4, column=1, sticky="ew", padx=0, pady=5)
 
@@ -350,55 +355,85 @@ class NetworkToolGUI:
 
         self.btn_info = ctk.CTkButton(action_buttons_frame, text="Show Network Info",
                                       command=self._start_show_network_info,
-                                      fg_color=self.colors['accent'], hover_color=self.colors['accent_hover'],
+                                      fg_color=self.colors['bg'],
+                                      border_color=self.colors['accent'],
+                                      border_width=2,
+                                      text_color=self.colors['text'],
+                                      hover_color=self.colors['card'],
                                       height=35)
         self.btn_info.grid(row=0, column=0, sticky="ew", padx=5, pady=5)
 
         self.btn_scan = ctk.CTkButton(action_buttons_frame, text="Scan Network", command=self._start_scan,
-                                      fg_color=self.colors['accent'], hover_color=self.colors['accent_hover'],
+                                      fg_color=self.colors['bg'],
+                                      border_color=self.colors['accent'],
+                                      border_width=2,
+                                      text_color=self.colors['text'],
+                                      hover_color=self.colors['card'],
                                       height=35)
         self.btn_scan.grid(row=0, column=1, sticky="ew", padx=5, pady=5)
 
         # Added Block All button
         self.btn_block_all = ctk.CTkButton(action_buttons_frame, text="Block All (Except Host/Gateway)",
                                            command=self._start_block_all,
-                                           fg_color=self.colors['error'], hover_color=self.colors['error'],
+                                           fg_color=self.colors['bg'], # Default background is black
+                                           border_color=self.colors['accent'], # Default border is neon green
+                                           border_width=2,
+                                           text_color=self.colors['text'],
+                                           hover_color=self.colors['card'],
                                            height=35)
         self.btn_block_all.grid(row=1, column=0, sticky="ew", padx=5, pady=5)
 
         # Original unblock all (now handles all active blocking)
         self.btn_unblock_all = ctk.CTkButton(action_buttons_frame, text="Unblock All Devices",
                                              command=self._start_unblock,
-                                             fg_color=self.colors['warning'], hover_color=self.colors['warning'],
+                                             fg_color=self.colors['bg'], # Default background is black
+                                             border_color=self.colors['accent'], # Default border is neon green
+                                             border_width=2,
+                                             text_color=self.colors['text'],
+                                             hover_color=self.colors['card'],
                                              height=35)
         self.btn_unblock_all.grid(row=1, column=1, sticky="ew", padx=5, pady=5)
 
         self.btn_monitor_bandwidth = ctk.CTkButton(action_buttons_frame, text="Start Bandwidth Monitor",
                                                    command=self._start_stop_bandwidth_monitor,
-                                                   fg_color=self.colors['success'],
-                                                   hover_color=self.colors['success'],
+                                                   fg_color=self.colors['bg'], # Default background is black
+                                                   border_color=self.colors['accent'], # Default border is neon green
+                                                   border_width=2,
+                                                   text_color=self.colors['text'],
+                                                   hover_color=self.colors['card'],
                                                    height=35)
         self.btn_monitor_bandwidth.grid(row=2, column=0, sticky="ew", padx=5, pady=5)
 
         # New Ping Device button
         self.btn_ping_device = ctk.CTkButton(action_buttons_frame, text="Ping Device",
                                              command=self._start_ping_test_dialog,
-                                             fg_color=self.colors['accent'], hover_color=self.colors['accent_hover'],
+                                             fg_color=self.colors['bg'],
+                                             border_color=self.colors['accent'],
+                                             border_width=2,
+                                             text_color=self.colors['text'],
+                                             hover_color=self.colors['card'],
                                              height=35)
         self.btn_ping_device.grid(row=2, column=1, sticky="ew", padx=5, pady=5)
 
         # New Refresh Interfaces button
         self.btn_refresh_interfaces = ctk.CTkButton(action_buttons_frame, text="Refresh Interfaces",
                                                     command=self._populate_interface_dropdown,
-                                                    fg_color=self.colors['accent'],
-                                                    hover_color=self.colors['accent_hover'],
+                                                    fg_color=self.colors['bg'],
+                                                    border_color=self.colors['accent'],
+                                                    border_width=2,
+                                                    text_color=self.colors['text'],
+                                                    hover_color=self.colors['card'],
                                                     height=35)
         self.btn_refresh_interfaces.grid(row=3, column=0, sticky="ew", padx=5, pady=5)
 
         # ESP32 Connect button
         self.btn_esp32_connect = ctk.CTkButton(action_buttons_frame, text="Connect to ESP32",
                                                command=self._start_esp32_connection,
-                                               fg_color=self.colors['accent'], hover_color=self.colors['accent_hover'],
+                                               fg_color=self.colors['bg'],
+                                               border_color=self.colors['accent'],
+                                               border_width=2,
+                                               text_color=self.colors['text'],
+                                               hover_color=self.colors['card'],
                                                height=35)
         self.btn_esp32_connect.grid(row=3, column=1, sticky="ew", padx=5, pady=5)
 
@@ -419,7 +454,7 @@ class NetworkToolGUI:
         self.log_textbox = ctk.CTkTextbox(
             log_panel,
             fg_color=self.colors['bg'],
-            text_color=self.colors['text_dim'],
+            text_color=self.colors['text_dim'], # Default text color
             wrap="word",
             state="disabled",
             font=ctk.CTkFont(family="Consolas", size=12)
@@ -521,6 +556,9 @@ class NetworkToolGUI:
         self.log_textbox.configure(state="normal")
         tag_name = f"{color}_tag" if color else "default_tag"
 
+        # Apply default color as neon green
+        self.log_textbox.tag_config("default_tag", foreground=self.colors['accent'])
+
         if color == "red":
             self.log_textbox.tag_config(tag_name, foreground=self.colors['error'])
         elif color == "yellow":
@@ -528,9 +566,10 @@ class NetworkToolGUI:
         elif color == "green":
             self.log_textbox.tag_config(tag_name, foreground=self.colors['success'])
         elif color == "blue":
-            self.log_textbox.tag_config(tag_name, foreground=self.colors['accent'])
+            self.log_textbox.tag_config(tag_name, foreground=self.colors['accent']) # Also use neon green for blue
         else:
-            self.log_textbox.tag_config(tag_name, foreground=self.colors['text'])
+            # Fallback to default tag if no specific color is provided or recognized
+            pass
 
         self.log_textbox.insert("end", f"{message}\n", tag_name)
         self.log_textbox.see("end")
@@ -550,44 +589,58 @@ class NetworkToolGUI:
         If busy is True, most UI elements are disabled. If busy is False, they are enabled
         based on the current state of blocking, bandwidth monitoring, and ESP32 connection.
         """
-        # 'busy' is passed for operations like scanning, pinging, which should disable most other things.
         is_scanning_or_pinging = busy
 
-        # general_disabled will disable main buttons like scan, show info, block all, etc.
-        # but individual unblock buttons might remain active if a device is being blocked.
         general_disabled = is_scanning_or_pinging or self.bandwidth_monitor_active or self.esp32_connected
 
-        # Default state for most buttons if no general busy state
-        general_state_if_not_blocking_specific = "disabled" if general_disabled else "normal"
+        # Base button styling without 'state'
+        base_button_style = {
+            "fg_color": self.colors['bg'],
+            "border_color": self.colors['accent'],
+            "border_width": 2,
+            "text_color": self.colors['text'],
+            "hover_color": self.colors['card'],
+        }
 
-        self.btn_info.configure(state=general_state_if_not_blocking_specific)
-        self.btn_scan.configure(state=general_state_if_not_blocking_specific)
-        self.ip_entry.configure(state=general_state_if_not_blocking_specific)
-        self.gateway_entry.configure(state=general_state_if_not_blocking_specific)
-        self.btn_ping_device.configure(state=general_state_if_not_blocking_specific)
-        self.interface_optionmenu.configure(state=general_state_if_not_blocking_specific)
-        self.btn_refresh_interfaces.configure(state=general_state_if_not_blocking_specific)
+        # Determine the general state for most buttons
+        general_state_for_buttons = "disabled" if general_disabled else "normal"
 
-        # Block All button state: disabled if any blocking (single or all) is active OR any general_disabled
-        self.btn_block_all.configure(state="disabled" if self.blocking_active or general_disabled else "normal")
+        # Configure common buttons using base style and explicit state
+        self.btn_info.configure(**base_button_style, state=general_state_for_buttons)
+        self.btn_scan.configure(**base_button_style, state=general_state_for_buttons)
+        self.ip_entry.configure(state=general_state_for_buttons)
+        self.gateway_entry.configure(state=general_state_for_buttons)
+        self.btn_ping_device.configure(**base_button_style, state=general_state_for_buttons)
+        self.interface_optionmenu.configure(state=general_state_for_buttons)
+        self.btn_refresh_interfaces.configure(**base_button_style, state=general_state_for_buttons)
+
+        # Block All button state
+        if self.blocking_active or general_disabled:
+            self.btn_block_all.configure(**base_button_style, text="Block All (Except Host/Gateway)", state="disabled")
+        else:
+            self.btn_block_all.configure(**base_button_style, text="Block All (Except Host/Gateway)", state="normal")
 
         # Bandwidth monitor button state
         if general_disabled and not self.bandwidth_monitor_active:
-            self.btn_monitor_bandwidth.configure(state="disabled")
+            self.btn_monitor_bandwidth.configure(**base_button_style, text="Start Bandwidth Monitor", state="disabled")
         elif self.bandwidth_monitor_active:
+            # When active, change appearance to indicate "stop"
             self.btn_monitor_bandwidth.configure(state="normal", text="Stop Bandwidth Monitor",
-                                                 fg_color=self.colors['error'], hover_color=self.colors['error'])
+                                                   fg_color=self.colors['error'], hover_color=self.colors['error'],
+                                                   border_width=0, text_color=self.colors['text'])
         else:
-            self.btn_monitor_bandwidth.configure(state="normal", text="Start Bandwidth Monitor",
-                                                 fg_color=self.colors['success'], hover_color=self.colors['success'])
+            self.btn_monitor_bandwidth.configure(**base_button_style, text="Start Bandwidth Monitor", state="normal")
 
-        # Unblock All/Stop Blocking button: always enabled if *any* blocking is active, otherwise follows general state
+
+        # Unblock All/Stop Blocking button
         if self.blocking_active:
-            self.btn_unblock_all.configure(state="normal", text="Stop All Blocking", fg_color=self.colors['error'],
-                                           hover_color=self.colors['error'])
+            # When active, change appearance to indicate "stop"
+            self.btn_unblock_all.configure(state="normal", text="Stop All Blocking",
+                                           fg_color=self.colors['error'], hover_color=self.colors['error'],
+                                           border_width=0, text_color=self.colors['text'])
         else:
-            self.btn_unblock_all.configure(state=general_state_if_not_blocking_specific, text="Unblock All Devices",
-                                           fg_color=self.colors['warning'], hover_color=self.colors['warning'])
+            self.btn_unblock_all.configure(**base_button_style, text="Unblock All Devices", state=general_state_for_buttons)
+
 
         self.root.after(0, lambda: self._update_esp32_button_state(ui_busy=is_scanning_or_pinging))
 
@@ -599,18 +652,17 @@ class NetworkToolGUI:
             if hasattr(device_frame, 'block_button'):
                 device_ip = device_frame.device_ip
                 if device_ip == my_ip:
-                    device_frame.block_button.configure(state="disabled", text="Host", fg_color="gray", hover_color="gray")
+                    device_frame.block_button.configure(state="disabled", text="Host", fg_color="gray", hover_color="gray", border_width=0)
                 elif device_ip == gateway_ip:
-                    device_frame.block_button.configure(state="disabled", text="Gateway", fg_color="gray", hover_color="gray")
+                    device_frame.block_button.configure(state="disabled", text="Gateway", fg_color="gray", hover_color="gray", border_width=0)
                 elif device_ip in self.active_block_operations:
-                    # Device is actively being blocked, button should allow unblocking if not generally busy
-                    state = "normal" if not general_disabled else "disabled"
-                    device_frame.block_button.configure(state=state, text="Unblock",
-                                                        fg_color=self.colors['warning'], hover_color=self.colors['warning'])
+                    # Device is actively being blocked, button should allow unblocking
+                    state_for_device_button = "normal" if not general_disabled else "disabled"
+                    device_frame.block_button.configure(state=state_for_device_button, text="Unblock",
+                                                        fg_color=self.colors['warning'], hover_color=self.colors['warning'], border_width=0, text_color=self.colors['text'])
                 else:  # Not host, not gateway, not currently blocking
-                    state = "normal" if not general_disabled else "disabled"
-                    device_frame.block_button.configure(state=state, text="Block",
-                                                        fg_color=self.colors['error'], hover_color=self.colors['error'])
+                    state_for_device_button = "normal" if not general_disabled else "disabled"
+                    device_frame.block_button.configure(**base_button_style, text="Block", state=state_for_device_button)
 
         self.root.update_idletasks()
 
@@ -754,8 +806,11 @@ class NetworkToolGUI:
                 device_frame,
                 text="Block", # Initial text
                 command=lambda ip=device['ip'], mac=device['mac']: self._toggle_block_device(ip, mac),
-                fg_color=self.colors['error'],
-                hover_color=self.colors['error'],
+                fg_color=self.colors['bg'],
+                border_color=self.colors['accent'],
+                border_width=2,
+                text_color=self.colors['text'],
+                hover_color=self.colors['card'],
                 width=80, height=25,
                 font=ctk.CTkFont(size=12)
             )
@@ -1225,8 +1280,7 @@ class NetworkToolGUI:
 
             self._set_ui_busy_state(True)  # Temporarily set UI busy
             self.bandwidth_monitor_active = True
-            self.btn_monitor_bandwidth.configure(text="Stop Bandwidth Monitor", fg_color=self.colors['error'],
-                                                 hover_color=self.colors['error'])
+            # Button will be configured by _set_ui_busy_state
             self.gui_log_output(f"Starting bandwidth monitor on interface '{selected_interface}'...", "green")
             logger.info(f"Bandwidth monitor started on {selected_interface}")
 
@@ -1249,8 +1303,7 @@ class NetworkToolGUI:
             self.bandwidth_monitor_active = False
             self.gui_log_output("Stopping bandwidth monitor...", "yellow")
             logger.info("Bandwidth monitor stopped.")
-            self.btn_monitor_bandwidth.configure(text="Start Bandwidth Monitor", fg_color=self.colors['success'],
-                                                 hover_color=self.colors['success'])
+            # Button will be configured by _set_ui_busy_state
 
             if self.bandwidth_thread and self.bandwidth_thread.is_alive():
                 self.bandwidth_thread.join(timeout=2)
@@ -1504,7 +1557,8 @@ class NetworkToolGUI:
 
         # Add a disconnect button to the console window itself
         disconnect_btn = ctk.CTkButton(frame, text="Disconnect ESP32", command=self._stop_esp32_connection,
-                                       fg_color=self.colors['error'], hover_color=self.colors['error'])
+                                       fg_color=self.colors['error'], hover_color=self.colors['error'],
+                                       border_width=0, text_color=self.colors['text']) # Disconnect button is red fill
         disconnect_btn.grid(row=1, column=0, pady=(0, 10))
 
         # Update the main GUI button (ensures it shows "Disconnect") - no need to call _set_ui_busy_state here again
@@ -1589,16 +1643,18 @@ class NetworkToolGUI:
             self.btn_refresh_esp32_ports.configure(state="disabled")
         else:
             if self.esp32_connected:
-                # When connected, show "Disconnect" and enable the button
+                # When connected, show "Disconnect" and enable the button, make it red
                 self.btn_esp32_connect.configure(text="Disconnect ESP32", fg_color=self.colors['error'],
-                                                 hover_color=self.colors['error'], state="normal")
+                                                 hover_color=self.colors['error'], state="normal",
+                                                 border_width=0, text_color=self.colors['text'])
                 # Disable port selection and refresh when actively connected
                 self.esp32_port_optionmenu.configure(state="disabled")
                 self.btn_refresh_esp32_ports.configure(state="disabled")
             else:
-                # When disconnected, show "Connect"
-                self.btn_esp32_connect.configure(text="Connect to ESP32", fg_color=self.colors['accent'],
-                                                 hover_color=self.colors['accent_hover'])
+                # When disconnected, show "Connect", default black background, neon green border
+                self.btn_esp32_connect.configure(text="Connect to ESP32", fg_color=self.colors['bg'],
+                                                 border_color=self.colors['accent'], border_width=2,
+                                                 text_color=self.colors['text'], hover_color=self.colors['card'])
 
                 # Enable Connect button, port selection, and refresh button only if ports are found
                 if self.esp32_port_names and self.esp32_port_names[0] != "No Ports Found":
