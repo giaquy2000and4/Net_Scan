@@ -1,4 +1,5 @@
-import os # Ensure os is imported first for environment variable handling
+import os  # Ensure os is imported first for environment variable handling
+import sys  # For graceful exit
 
 # --- START OF FIX for PermissionError: [Errno 13] Permission denied: 'C:\\sslkeys.txt' ---
 # Explicitly delete SSLKEYLOGFILE from environment to prevent PermissionError
@@ -7,10 +8,10 @@ if "SSLKEYLOGFILE" in os.environ:
     try:
         del os.environ["SSLKEYLOGFILE"]
     except Exception:
-        pass # Ignore errors if it's already gone or inaccessible
+        pass  # Ignore errors if it's already gone or inaccessible
 # --- END OF FIX ---
 
-os.environ.pop("SSLKEYLOGFILE", None) # Keep this original line, it's harmless if the above works
+os.environ.pop("SSLKEYLOGFILE", None)  # Keep this original line, it's harmless if the above works
 
 import customtkinter as ctk
 from tkinter import messagebox, simpledialog
@@ -28,9 +29,11 @@ import serial
 import serial.tools.list_ports
 import requests
 import json
+from concurrent.futures import ThreadPoolExecutor  # NEW: For managing API lookup threads
 
 try:
     import certifi
+
     os.environ.setdefault("SSL_CERT_FILE", certifi.where())
 except Exception:
     pass
@@ -191,7 +194,8 @@ def get_my_ip_global():
                     return addr.address
     return None
 
-# NEW: MAC Vendor Lookup Function
+
+# MAC Vendor Lookup Function
 def mac_lookup(mac_address, api_token):
     """
     Looks up the vendor of a MAC address using the MacVendors API.
@@ -202,7 +206,7 @@ def mac_lookup(mac_address, api_token):
     if not mac_address or mac_address == "N/A":
         return "N/A"
 
-    # FIX: Corrected API endpoint URL
+    # FIX: Corrected API endpoint URL based on provided documentation
     url = f"https://api.macvendors.com/v1/lookup/{mac_address}"
     headers = {
         "Authorization": f"Bearer {api_token}",
@@ -210,7 +214,7 @@ def mac_lookup(mac_address, api_token):
     }
     try:
         response = requests.get(url, headers=headers, timeout=5)
-        response.raise_for_status() # Raise an exception for HTTP errors
+        response.raise_for_status()  # Raise an exception for HTTP errors
         data = response.json()
         if "data" in data and "organization_name" in data["data"]:
             return data["data"]["organization_name"]
@@ -286,10 +290,13 @@ class NetworkToolGUI:
         self.esp32_read_thread = None
         self.esp32_baud_rate = 115200  # Fixed baud rate for simplicity
 
-        # NEW: Settings
+        # NEW: Settings and MAC Vendor Lookup Optimization
         self.settings = {}
-        self._load_settings() # Load settings at startup
+        self._load_settings()  # Load settings at startup
         self.mac_vendor_api_token = self.settings.get('mac_vendor_api_token', '')
+        self.mac_vendor_cache = {}  # In-memory cache for MAC vendor lookups
+        # Initialize ThreadPoolExecutor for concurrent MAC lookups
+        self.mac_lookup_executor = ThreadPoolExecutor(max_workers=5)  # Limit to 5 concurrent API calls
 
         # Local machine info (general, not specific to selected interface)
         self.my_ip_global = get_my_ip_global()
@@ -311,6 +318,36 @@ class NetworkToolGUI:
         self._populate_interface_dropdown()  # Initial population
         self._populate_esp32_port_dropdown()  # Initial population for ESP32 ports
 
+        # Set protocol for graceful shutdown
+        self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
+
+    # NEW: Graceful shutdown
+    def _on_closing(self):
+        """Handles graceful shutdown of the application, including thread pools."""
+        self.gui_log_output("Closing application...", "blue")
+        logger.info("Application is shutting down.")
+
+        # Stop all blocking operations
+        if self.blocking_active:
+            self._stop_all_blocking_internal()
+
+        # Stop bandwidth monitor
+        if self.bandwidth_monitor_active:
+            self._stop_bandwidth_monitor_task()
+
+        # Disconnect ESP32
+        if self.esp32_connected:
+            self._stop_esp32_connection()
+
+        # Shut down MAC lookup executor
+        if self.mac_lookup_executor:
+            self.gui_log_output("Shutting down MAC lookup executor...", "blue")
+            self.mac_lookup_executor.shutdown(wait=True)  # Wait for pending tasks to complete
+            self.gui_log_output("MAC lookup executor shut down.", "blue")
+
+        self.root.destroy()
+        sys.exit(0)  # Ensure a clean exit
+
     # NEW: Load and Save Settings
     def _load_settings(self):
         """Loads settings from a JSON file."""
@@ -331,7 +368,6 @@ class NetworkToolGUI:
             self.gui_log_output("Error reading config.json, using default settings.", "red")
             logger.error("Error decoding config.json, using default settings.")
         self.mac_vendor_api_token = self.settings.get('mac_vendor_api_token', '')
-
 
     def _save_settings(self):
         """Saves current settings to a JSON file."""
@@ -386,7 +422,8 @@ class NetworkToolGUI:
                                                                                                                 pady=5)
         self.ip_entry = ctk.CTkEntry(input_frame,
                                      placeholder_text="Enter IP range for scanning (optional if interface selected)",
-                                     fg_color=self.colors['bg'], border_color=self.colors['accent'], text_color=self.colors['text'])
+                                     fg_color=self.colors['bg'], border_color=self.colors['accent'],
+                                     text_color=self.colors['text'])
         self.ip_entry.grid(row=0, column=1, sticky="ew", pady=5)
 
         ctk.CTkLabel(input_frame, text="Gateway IP (e.g., 192.168.1.1):", text_color=self.colors['text']).grid(row=1,
@@ -397,7 +434,8 @@ class NetworkToolGUI:
                                                                                                                    10),
                                                                                                                pady=5)
         self.gateway_entry = ctk.CTkEntry(input_frame, placeholder_text="Enter Gateway IP for blocking",
-                                          fg_color=self.colors['bg'], border_color=self.colors['accent'], text_color=self.colors['text'])
+                                          fg_color=self.colors['bg'], border_color=self.colors['accent'],
+                                          text_color=self.colors['text'])
         self.gateway_entry.grid(row=1, column=1, sticky="ew", pady=5)
 
         # Interface Selection
@@ -409,8 +447,9 @@ class NetworkToolGUI:
                                                       values=self.interface_names,
                                                       variable=self.selected_interface_var,
                                                       command=self._on_interface_selected,
-                                                      fg_color=self.colors['bg'], # Background of the dropdown list
-                                                      button_color=self.colors['accent'], # Background of the selected item / dropdown button
+                                                      fg_color=self.colors['bg'],  # Background of the dropdown list
+                                                      button_color=self.colors['accent'],
+                                                      # Background of the selected item / dropdown button
                                                       button_hover_color=self.colors['accent_hover'],
                                                       text_color=self.colors['text'])
         self.interface_optionmenu.grid(row=2, column=1, sticky="ew", pady=5)
@@ -423,8 +462,9 @@ class NetworkToolGUI:
         self.esp32_port_optionmenu = ctk.CTkOptionMenu(input_frame,
                                                        values=self.esp32_port_names,  # Will be populated
                                                        variable=self.selected_esp32_port_var,
-                                                       fg_color=self.colors['bg'], # Background of the dropdown list
-                                                       button_color=self.colors['accent'], # Background of the selected item / dropdown button
+                                                       fg_color=self.colors['bg'],  # Background of the dropdown list
+                                                       button_color=self.colors['accent'],
+                                                       # Background of the selected item / dropdown button
                                                        button_hover_color=self.colors['accent_hover'],
                                                        text_color=self.colors['text'])
         self.esp32_port_optionmenu.grid(row=3, column=1, sticky="ew", pady=5)
@@ -466,8 +506,8 @@ class NetworkToolGUI:
         # Added Block All button
         self.btn_block_all = ctk.CTkButton(action_buttons_frame, text="Block All (Except Host/Gateway)",
                                            command=self._start_block_all,
-                                           fg_color=self.colors['bg'], # Default background is black
-                                           border_color=self.colors['accent'], # Default border is neon green
+                                           fg_color=self.colors['bg'],  # Default background is black
+                                           border_color=self.colors['accent'],  # Default border is neon green
                                            border_width=2,
                                            text_color=self.colors['text'],
                                            hover_color=self.colors['card'],
@@ -477,8 +517,8 @@ class NetworkToolGUI:
         # Original unblock all (now handles all active blocking)
         self.btn_unblock_all = ctk.CTkButton(action_buttons_frame, text="Unblock All Devices",
                                              command=self._start_unblock,
-                                             fg_color=self.colors['bg'], # Default background is black
-                                             border_color=self.colors['accent'], # Default border is neon green
+                                             fg_color=self.colors['bg'],  # Default background is black
+                                             border_color=self.colors['accent'],  # Default border is neon green
                                              border_width=2,
                                              text_color=self.colors['text'],
                                              hover_color=self.colors['card'],
@@ -487,8 +527,8 @@ class NetworkToolGUI:
 
         self.btn_monitor_bandwidth = ctk.CTkButton(action_buttons_frame, text="Start Bandwidth Monitor",
                                                    command=self._start_stop_bandwidth_monitor,
-                                                   fg_color=self.colors['bg'], # Default background is black
-                                                   border_color=self.colors['accent'], # Default border is neon green
+                                                   fg_color=self.colors['bg'],  # Default background is black
+                                                   border_color=self.colors['accent'],  # Default border is neon green
                                                    border_width=2,
                                                    text_color=self.colors['text'],
                                                    hover_color=self.colors['card'],
@@ -542,7 +582,8 @@ class NetworkToolGUI:
         # Status Indicator (Blocking and Bandwidth Monitor)
         self.blocking_status_label = ctk.CTkLabel(action_buttons_frame, text="Status: Idle",
                                                   text_color=self.colors['text_dim'])
-        self.blocking_status_label.grid(row=4, column=1, sticky="ew", padx=5, pady=5) # Adjusted row/column due to new settings button
+        self.blocking_status_label.grid(row=4, column=1, sticky="ew", padx=5,
+                                        pady=5)  # Adjusted row/column due to new settings button
 
         # Log Panel (now on the left, row 1, column 0)
         log_panel = ctk.CTkFrame(content_frame, fg_color=self.colors['card'], corner_radius=10)
@@ -555,7 +596,7 @@ class NetworkToolGUI:
         self.log_textbox = ctk.CTkTextbox(
             log_panel,
             fg_color=self.colors['bg'],
-            text_color=self.colors['text_dim'], # Default text color
+            text_color=self.colors['text_dim'],  # Default text color
             wrap="word",
             state="disabled",
             font=ctk.CTkFont(family="Consolas", size=12)
@@ -588,34 +629,38 @@ class NetworkToolGUI:
     def _open_settings_window(self):
         """Opens a new Toplevel window for application settings."""
         if hasattr(self, 'settings_window') and self.settings_window.winfo_exists():
-            self.settings_window.lift() # Bring to front if already open
+            self.settings_window.lift()  # Bring to front if already open
             return
 
         self.settings_window = ctk.CTkToplevel(self.root)
         self.settings_window.title("Settings")
         self.settings_window.geometry("500x250")
-        self.settings_window.grab_set() # Make it modal
+        self.settings_window.grab_set()  # Make it modal
 
         settings_frame = ctk.CTkFrame(self.settings_window, fg_color=self.colors['card'])
         settings_frame.pack(fill="both", expand=True, padx=20, pady=20)
         settings_frame.grid_columnconfigure(1, weight=1)
 
         # MAC Vendor API Token Setting
-        ctk.CTkLabel(settings_frame, text="MAC Vendor API Token:", text_color=self.colors['text']).grid(row=0, column=0, sticky="w", padx=10, pady=10)
-        self.mac_api_token_entry = ctk.CTkEntry(settings_frame, width=300, fg_color=self.colors['bg'], border_color=self.colors['accent'], text_color=self.colors['text'])
+        ctk.CTkLabel(settings_frame, text="MAC Vendor API Token:", text_color=self.colors['text']).grid(row=0, column=0,
+                                                                                                        sticky="w",
+                                                                                                        padx=10,
+                                                                                                        pady=10)
+        self.mac_api_token_entry = ctk.CTkEntry(settings_frame, width=300, fg_color=self.colors['bg'],
+                                                border_color=self.colors['accent'], text_color=self.colors['text'])
         self.mac_api_token_entry.grid(row=0, column=1, sticky="ew", padx=10, pady=10)
-        self.mac_api_token_entry.insert(0, self.mac_vendor_api_token) # Load current token
+        self.mac_api_token_entry.insert(0, self.mac_vendor_api_token)  # Load current token
 
         # Buttons
         button_frame = ctk.CTkFrame(settings_frame, fg_color="transparent")
         button_frame.grid(row=1, column=0, columnspan=2, pady=10)
-        button_frame.grid_columnconfigure((0,1), weight=1)
+        button_frame.grid_columnconfigure((0, 1), weight=1)
 
         save_button = ctk.CTkButton(button_frame, text="Save Settings",
                                     command=self._save_settings_and_close_window,
                                     fg_color=self.colors['accent'],
                                     hover_color=self.colors['accent_hover'],
-                                    text_color=self.colors['bg'], # Dark text for green button
+                                    text_color=self.colors['bg'],  # Dark text for green button
                                     height=35)
         save_button.grid(row=0, column=0, padx=5, pady=5)
 
@@ -631,13 +676,18 @@ class NetworkToolGUI:
 
     def _save_settings_and_close_window(self):
         """Saves settings from the settings window and closes it."""
-        self.mac_vendor_api_token = self.mac_api_token_entry.get()
-        self.settings['mac_vendor_api_token'] = self.mac_vendor_api_token
-        self._save_settings()
+        new_token = self.mac_api_token_entry.get()
+        if self.mac_vendor_api_token != new_token:
+            self.mac_vendor_api_token = new_token
+            self.settings['mac_vendor_api_token'] = self.mac_vendor_api_token
+            self._save_settings()
+            self.gui_log_output("MAC Vendor API Token updated and cache cleared.", "green")
+            self.mac_vendor_cache.clear()  # Clear cache when token changes
+        else:
+            self.gui_log_output("MAC Vendor API Token unchanged.", "blue")
+
         if hasattr(self, 'settings_window') and self.settings_window.winfo_exists():
             self.settings_window.destroy()
-        self.gui_log_output("MAC Vendor API Token updated.", "green")
-
 
     def _populate_interface_dropdown(self):
         """Fetches active interfaces and populates the dropdown menu."""
@@ -722,7 +772,7 @@ class NetworkToolGUI:
         elif color == "green":
             self.log_textbox.tag_config(tag_name, foreground=self.colors['success'])
         elif color == "blue":
-            self.log_textbox.tag_config(tag_name, foreground=self.colors['accent']) # Also use neon green for blue
+            self.log_textbox.tag_config(tag_name, foreground=self.colors['accent'])  # Also use neon green for blue
         else:
             # Fallback to default tag if no specific color is provided or recognized
             pass
@@ -766,30 +816,36 @@ class NetworkToolGUI:
         if hasattr(self, 'btn_scan'): self.btn_scan.configure(**base_button_style, state=general_state_for_buttons)
         if hasattr(self, 'ip_entry'): self.ip_entry.configure(state=general_state_for_buttons)
         if hasattr(self, 'gateway_entry'): self.gateway_entry.configure(state=general_state_for_buttons)
-        if hasattr(self, 'btn_ping_device'): self.btn_ping_device.configure(**base_button_style, state=general_state_for_buttons)
+        if hasattr(self, 'btn_ping_device'): self.btn_ping_device.configure(**base_button_style,
+                                                                            state=general_state_for_buttons)
         if hasattr(self, 'interface_optionmenu'): self.interface_optionmenu.configure(state=general_state_for_buttons)
-        if hasattr(self, 'btn_refresh_interfaces'): self.btn_refresh_interfaces.configure(**base_button_style, state=general_state_for_buttons)
-        if hasattr(self, 'btn_settings'): self.btn_settings.configure(**base_button_style, state=general_state_for_buttons) # NEW: Settings button
+        if hasattr(self, 'btn_refresh_interfaces'): self.btn_refresh_interfaces.configure(**base_button_style,
+                                                                                          state=general_state_for_buttons)
+        if hasattr(self, 'btn_settings'): self.btn_settings.configure(**base_button_style,
+                                                                      state=general_state_for_buttons)  # NEW: Settings button
 
         # Block All button state
         if hasattr(self, 'btn_block_all'):
             if self.blocking_active or general_disabled:
-                self.btn_block_all.configure(**base_button_style, text="Block All (Except Host/Gateway)", state="disabled")
+                self.btn_block_all.configure(**base_button_style, text="Block All (Except Host/Gateway)",
+                                             state="disabled")
             else:
-                self.btn_block_all.configure(**base_button_style, text="Block All (Except Host/Gateway)", state="normal")
+                self.btn_block_all.configure(**base_button_style, text="Block All (Except Host/Gateway)",
+                                             state="normal")
 
         # Bandwidth monitor button state
         if hasattr(self, 'btn_monitor_bandwidth'):
             if general_disabled and not self.bandwidth_monitor_active:
-                self.btn_monitor_bandwidth.configure(**base_button_style, text="Start Bandwidth Monitor", state="disabled")
+                self.btn_monitor_bandwidth.configure(**base_button_style, text="Start Bandwidth Monitor",
+                                                     state="disabled")
             elif self.bandwidth_monitor_active:
                 # When active, change appearance to indicate "stop"
                 self.btn_monitor_bandwidth.configure(state="normal", text="Stop Bandwidth Monitor",
-                                                       fg_color=self.colors['error'], hover_color=self.colors['error'],
-                                                       border_width=0, text_color=self.colors['text'])
+                                                     fg_color=self.colors['error'], hover_color=self.colors['error'],
+                                                     border_width=0, text_color=self.colors['text'])
             else:
-                self.btn_monitor_bandwidth.configure(**base_button_style, text="Start Bandwidth Monitor", state="normal")
-
+                self.btn_monitor_bandwidth.configure(**base_button_style, text="Start Bandwidth Monitor",
+                                                     state="normal")
 
         # Unblock All/Stop Blocking button
         if hasattr(self, 'btn_unblock_all'):
@@ -799,8 +855,8 @@ class NetworkToolGUI:
                                                fg_color=self.colors['error'], hover_color=self.colors['error'],
                                                border_width=0, text_color=self.colors['text'])
             else:
-                self.btn_unblock_all.configure(**base_button_style, text="Unblock All Devices", state=general_state_for_buttons)
-
+                self.btn_unblock_all.configure(**base_button_style, text="Unblock All Devices",
+                                               state=general_state_for_buttons)
 
         self.root.after(0, lambda: self._update_esp32_button_state(ui_busy=is_scanning_or_pinging))
 
@@ -814,17 +870,22 @@ class NetworkToolGUI:
             if hasattr(device_frame, 'block_button') and hasattr(device_frame, 'device_ip'):
                 device_ip = device_frame.device_ip
                 if device_ip == my_ip:
-                    device_frame.block_button.configure(state="disabled", text="Host", fg_color="gray", hover_color="gray", border_width=0)
+                    device_frame.block_button.configure(state="disabled", text="Host", fg_color="gray",
+                                                        hover_color="gray", border_width=0)
                 elif device_ip == gateway_ip:
-                    device_frame.block_button.configure(state="disabled", text="Gateway", fg_color="gray", hover_color="gray", border_width=0)
+                    device_frame.block_button.configure(state="disabled", text="Gateway", fg_color="gray",
+                                                        hover_color="gray", border_width=0)
                 elif device_ip in self.active_block_operations:
                     # Device is actively being blocked, button should allow unblocking
                     state_for_device_button = "normal" if not general_disabled else "disabled"
                     device_frame.block_button.configure(state=state_for_device_button, text="Unblock",
-                                                        fg_color=self.colors['warning'], hover_color=self.colors['warning'], border_width=0, text_color=self.colors['text'])
+                                                        fg_color=self.colors['warning'],
+                                                        hover_color=self.colors['warning'], border_width=0,
+                                                        text_color=self.colors['text'])
                 else:  # Not host, not gateway, not currently blocking
                     state_for_device_button = "normal" if not general_disabled else "disabled"
-                    device_frame.block_button.configure(**base_button_style, text="Block", state=state_for_device_button)
+                    device_frame.block_button.configure(**base_button_style, text="Block",
+                                                        state=state_for_device_button)
 
         self.root.update_idletasks()
 
@@ -895,8 +956,8 @@ class NetworkToolGUI:
             devices = scan_network(ip_range, iface=scan_interface)  # Pass the interface to scan_network
             self.scanned_devices = devices  # Store for block all
             self.gui_log_output(f"--- Found {len(devices)} Devices ---", "green")
-            self.root.after(0, lambda: self.update_device_list(devices)) # Call update_device_list
-            # The vendor lookup will be initiated from within update_device_list for each device.
+            self.root.after(0, lambda: self.update_device_list(devices))
+            # The vendor lookup will now be managed by the ThreadPoolExecutor within update_device_list.
 
             if devices:
                 save_devices_to_file(devices)
@@ -936,18 +997,18 @@ class NetworkToolGUI:
         header_frame.grid_columnconfigure(1, weight=2)
         header_frame.grid_columnconfigure(2, weight=1)
         header_frame.grid_columnconfigure(3, weight=1)
-        header_frame.grid_columnconfigure(4, weight=1) # NEW: Column for Vendor
+        header_frame.grid_columnconfigure(4, weight=1)  # NEW: Column for Vendor
 
         ctk.CTkLabel(header_frame, text="IP Address", font=ctk.CTkFont(weight="bold"),
                      text_color=self.colors['text']).grid(row=0, column=0, sticky="w", padx=5)
         ctk.CTkLabel(header_frame, text="MAC Address", font=ctk.CTkFont(weight="bold"),
                      text_color=self.colors['text']).grid(row=0, column=1, sticky="w", padx=5)
-        ctk.CTkLabel(header_frame, text="Vendor", font=ctk.CTkFont(weight="bold"), # NEW: Vendor Header
+        ctk.CTkLabel(header_frame, text="Vendor", font=ctk.CTkFont(weight="bold"),  # NEW: Vendor Header
                      text_color=self.colors['text']).grid(row=0, column=2, sticky="w", padx=5)
         ctk.CTkLabel(header_frame, text="Bandwidth", font=ctk.CTkFont(weight="bold"),
                      text_color=self.colors['text']).grid(row=0, column=3, sticky="w", padx=5)
         ctk.CTkLabel(header_frame, text="Action", font=ctk.CTkFont(weight="bold"), text_color=self.colors['text']).grid(
-            row=0, column=4, sticky="w", padx=5) # Adjusted column
+            row=0, column=4, sticky="w", padx=5)  # Adjusted column
 
         for i, device in enumerate(devices):
             device_frame = ctk.CTkFrame(self.devices_scroll_frame, fg_color=self.colors['card'], corner_radius=5)
@@ -956,7 +1017,7 @@ class NetworkToolGUI:
             device_frame.grid_columnconfigure(1, weight=2)
             device_frame.grid_columnconfigure(2, weight=1)
             device_frame.grid_columnconfigure(3, weight=1)
-            device_frame.grid_columnconfigure(4, weight=1) # NEW: Column for Vendor
+            device_frame.grid_columnconfigure(4, weight=1)  # NEW: Column for Vendor
 
             ctk.CTkLabel(device_frame, text=device['ip'], text_color=self.colors['text']).grid(row=0, column=0,
                                                                                                sticky="w", padx=5,
@@ -967,18 +1028,26 @@ class NetworkToolGUI:
             # NEW: Vendor Label
             vendor_label = ctk.CTkLabel(device_frame, text="Looking up...", text_color=self.colors['text_dim'])
             vendor_label.grid(row=0, column=2, sticky="w", padx=5, pady=2)
-            # Start a thread to look up MAC vendor
-            threading.Thread(target=self._lookup_mac_vendor_and_update_label,
-                             args=(device['mac'], vendor_label), daemon=True).start()
 
+            # Check cache first
+            cached_vendor = self.mac_vendor_cache.get(device['mac'])
+            if cached_vendor:
+                # Update label immediately from cache
+                label_color = self.colors['text'] if not "Error" in cached_vendor else self.colors['warning']
+                self.root.after(0, lambda l=vendor_label, v=cached_vendor, c=label_color: l.configure(text=v,
+                                                                                                      text_color=c))
+            else:
+                # Submit task to ThreadPoolExecutor for API lookup
+                self.mac_lookup_executor.submit(self._lookup_mac_vendor_and_update_label_task, device['mac'],
+                                                vendor_label)
 
             bandwidth_label = ctk.CTkLabel(device_frame, text="0.0 KB/s", text_color=self.colors['text_dim'])
-            bandwidth_label.grid(row=0, column=3, sticky="w", padx=5, pady=2) # Adjusted column
+            bandwidth_label.grid(row=0, column=3, sticky="w", padx=5, pady=2)  # Adjusted column
             self.bandwidth_display_labels[device['ip']] = bandwidth_label
 
             block_btn = ctk.CTkButton(
                 device_frame,
-                text="Block", # Initial text
+                text="Block",  # Initial text
                 command=lambda ip=device['ip'], mac=device['mac']: self._toggle_block_device(ip, mac),
                 fg_color=self.colors['bg'],
                 border_color=self.colors['accent'],
@@ -988,23 +1057,27 @@ class NetworkToolGUI:
                 width=80, height=25,
                 font=ctk.CTkFont(size=12)
             )
-            block_btn.grid(row=0, column=4, sticky="e", padx=5, pady=2) # Adjusted column
+            block_btn.grid(row=0, column=4, sticky="e", padx=5, pady=2)  # Adjusted column
 
             device_frame.block_button = block_btn
             device_frame.device_ip = device['ip']  # Store IP on the frame for _set_ui_busy_state
 
-        self.root.after(0, lambda: self._set_ui_busy_state(False)) # Refresh UI to set initial button states
+        self.root.after(0, lambda: self._set_ui_busy_state(False))  # Refresh UI to set initial button states
 
-    # NEW: Threaded MAC Vendor Lookup
-    def _lookup_mac_vendor_and_update_label(self, mac_address, label_widget):
+    # NEW: Threaded MAC Vendor Lookup Task (called by executor)
+    def _lookup_mac_vendor_and_update_label_task(self, mac_address, label_widget):
         """
-        Performs MAC vendor lookup in a thread and updates the given label widget.
+        Performs MAC vendor lookup and updates the given label widget.
+        This runs in a separate thread managed by the ThreadPoolExecutor.
         """
         vendor_name = mac_lookup(mac_address, self.mac_vendor_api_token)
-        # Update the GUI label in the main thread
-        self.root.after(0, lambda: label_widget.configure(text=vendor_name,
-                                                          text_color=self.colors['text'] if not "Error" in vendor_name else self.colors['warning']))
+        # Store in cache if not an error
+        if "Error" not in vendor_name and "Unknown Vendor" not in vendor_name and "N/A" not in vendor_name:
+            self.mac_vendor_cache[mac_address] = vendor_name
 
+        # Update the GUI label in the main thread
+        label_color = self.colors['text'] if not "Error" in vendor_name else self.colors['warning']
+        self.root.after(0, lambda l=label_widget, v=vendor_name, c=label_color: l.configure(text=v, text_color=c))
 
     def _toggle_block_device(self, ip_address, mac_address):
         """Toggles blocking for a single device."""
@@ -1078,7 +1151,7 @@ class NetworkToolGUI:
             return
 
         op_details = self.active_block_operations[target_ip]
-        op_details['event'].set() # Signal the blocking thread to stop
+        op_details['event'].set()  # Signal the blocking thread to stop
 
         self.gui_log_output(f"Stopping blocking for {target_ip} and restoring ARP...", "yellow")
         logger.warning(f"User initiated stop for blocking of {target_ip}.")
@@ -1100,13 +1173,15 @@ class NetworkToolGUI:
                 op_details['interface']
             )
         else:
-            self.gui_log_output(f"Could not restore ARP for {target_ip}: missing MAC details. Attempting general scan restore.", "warning")
+            self.gui_log_output(
+                f"Could not restore ARP for {target_ip}: missing MAC details. Attempting general scan restore.",
+                "warning")
             # Fallback for old/unreliable data, try to restore with current info
             self._restore_arp_for_device(
                 target_ip,
-                get_mac(target_ip, iface=op_details['interface']), # Try to get current MAC
+                get_mac(target_ip, iface=op_details['interface']),  # Try to get current MAC
                 op_details['gateway_ip'],
-                get_mac(op_details['gateway_ip'], iface=op_details['interface']), # Try to get current MAC
+                get_mac(op_details['gateway_ip'], iface=op_details['interface']),  # Try to get current MAC
                 op_details['interface']
             )
 
@@ -1115,7 +1190,6 @@ class NetworkToolGUI:
         self.root.after(0, self._check_and_update_global_blocking_status)
         self.gui_log_output(f"Blocking stopped and ARP restored for {target_ip}.", "green")
         messagebox.showinfo("Unblock Complete", f"Thiết bị {target_ip} đã được bỏ chặn.")
-
 
     def _restore_arp_for_device(self, target_ip, target_mac, gateway_ip, gateway_mac, interface):
         """Restores ARP tables for a single target and gateway."""
@@ -1129,7 +1203,9 @@ class NetworkToolGUI:
             logger.error(f"Failed to restore ARP for {target_ip} due to missing MAC addresses on {interface}.")
             return
 
-        self.gui_log_output(f"Restoring ARP for {target_ip} (MAC: {target_mac}) and Gateway {gateway_ip} (MAC: {gateway_mac})...", "green")
+        self.gui_log_output(
+            f"Restoring ARP for {target_ip} (MAC: {target_mac}) and Gateway {gateway_ip} (MAC: {gateway_mac})...",
+            "green")
 
         try:
             # Restore target's ARP table: target should see gateway's real MAC for gateway_ip
@@ -1218,8 +1294,9 @@ class NetworkToolGUI:
                     self.gui_log_output(f"Started blocking thread for {ip_address}", "red")
                     time.sleep(0.1)  # Small delay to not flood with threads immediately
 
-            self.root.after(0, lambda: self.blocking_status_label.configure(text=f"Status: Blocking {len(self.active_block_operations)} devices...",
-                                                                            text_color=self.colors['error']))
+            self.root.after(0, lambda: self.blocking_status_label.configure(
+                text=f"Status: Blocking {len(self.active_block_operations)} devices...",
+                text_color=self.colors['error']))
             self.root.after(0, lambda: self._set_ui_busy_state(False))  # Refresh UI
 
         except Exception as e:
@@ -1235,7 +1312,8 @@ class NetworkToolGUI:
         try:
             gateway_mac = get_mac(gateway_ip, iface=spoofing_interface)
             if not gateway_mac:
-                self.gui_log_output(f"Could not find MAC address of gateway {gateway_ip}. Blocking {target_ip} failed.", "red")
+                self.gui_log_output(f"Could not find MAC address of gateway {gateway_ip}. Blocking {target_ip} failed.",
+                                    "red")
                 logger.error(
                     f"Could not find MAC for gateway {gateway_ip} on interface {spoofing_interface}. Blocking of {target_ip} failed.")
                 return
@@ -1251,7 +1329,7 @@ class NetworkToolGUI:
 
             while not stop_event.is_set():
                 packet_victim = Ether(dst=target_mac) / ARP(op=2, pdst=target_ip, psrc=gateway_ip, hwdst=target_mac,
-                                                             hwsrc=my_mac)
+                                                            hwsrc=my_mac)
                 packet_gateway = Ether(dst=gateway_mac) / ARP(op=2, pdst=gateway_ip, psrc=target_ip, hwdst=gateway_mac,
                                                               hwsrc=my_mac)
                 sendp(packet_victim, verbose=0, iface=spoofing_interface)
@@ -1277,8 +1355,9 @@ class NetworkToolGUI:
             self.root.after(0, lambda: self.blocking_status_label.configure(text="Status: Idle",
                                                                             text_color=self.colors['text_dim']))
         else:
-            self.root.after(0, lambda: self.blocking_status_label.configure(text=f"Status: Blocking {len(self.active_block_operations)} devices...",
-                                                                            text_color=self.colors['error']))
+            self.root.after(0, lambda: self.blocking_status_label.configure(
+                text=f"Status: Blocking {len(self.active_block_operations)} devices...",
+                text_color=self.colors['error']))
         self.root.after(0, lambda: self._set_ui_busy_state(False))  # Refresh UI elements
 
     def _stop_all_blocking_internal(self):
@@ -1286,7 +1365,8 @@ class NetworkToolGUI:
         if not self.active_block_operations:
             return
 
-        self.gui_log_output(f"Stopping {len(self.active_block_operations)} active blocking operations internally...", "yellow")
+        self.gui_log_output(f"Stopping {len(self.active_block_operations)} active blocking operations internally...",
+                            "yellow")
 
         # Signal all active blocking threads to stop
         for ip, op_details in list(self.active_block_operations.items()):
@@ -1294,7 +1374,7 @@ class NetworkToolGUI:
 
         # Wait for threads to terminate and perform ARP restore
         threads_to_join = []
-        restore_info = [] # (target_ip, target_mac, gateway_ip, gateway_mac, interface)
+        restore_info = []  # (target_ip, target_mac, gateway_ip, gateway_mac, interface)
 
         for ip, op_details in list(self.active_block_operations.items()):
             threads_to_join.append(op_details['thread'])
@@ -1320,8 +1400,7 @@ class NetworkToolGUI:
         self.active_block_operations.clear()
 
         self.blocking_active = False
-        self.root.after(0, self._check_and_update_global_blocking_status) # Update UI to reflect idle state
-
+        self.root.after(0, self._check_and_update_global_blocking_status)  # Update UI to reflect idle state
 
     def _start_unblock(self):
         """Initiates unblocking process for all currently blocked devices and restores ARP for known devices."""
@@ -1345,14 +1424,14 @@ class NetworkToolGUI:
 
         # The actual removal from active_block_operations happens in block_device_task's finally block.
         # We start the unblock task, which will handle waiting for threads and ARP restoration.
-        self.blocking_active = False # Global state is now False for the UI refresh
+        self.blocking_active = False  # Global state is now False for the UI refresh
 
         self.root.after(0, lambda: self.blocking_status_label.configure(text="Status: Stopping Block...",
                                                                         text_color=self.colors['warning']))
 
         threading.Thread(target=self.unblock_devices_task, daemon=True).start()
 
-    def unblock_devices_task(self,):
+    def unblock_devices_task(self, ):
         """Task to restore ARP tables for all known devices."""
         try:
             selected_interface = self.selected_interface_var.get()
@@ -1372,7 +1451,8 @@ class NetworkToolGUI:
             if not my_ip or not my_mac:
                 messagebox.showerror("Lỗi",
                                      "Không thể lấy địa chỉ IP/MAC cục bộ của giao diện đã chọn. Vui lòng thử lại hoặc kiểm tra kết nối mạng.")
-                self.gui_log_output("Failed to get local IP/MAC for selected interface, cannot perform unblocking.", "red")
+                self.gui_log_output("Failed to get local IP/MAC for selected interface, cannot perform unblocking.",
+                                    "red")
                 return
 
             devices_to_restore = []
@@ -1415,13 +1495,14 @@ class NetworkToolGUI:
 
             for device in devices_to_restore:
                 target_ip = device['ip']
-                target_mac = device['mac'] # Use scanned MAC, or re-discover if None
+                target_mac = device['mac']  # Use scanned MAC, or re-discover if None
 
                 # For full unblock, we need the *actual* MACs. Let's try to get them fresh.
                 target_actual_mac = get_mac(target_ip, iface=selected_interface)
                 gateway_actual_mac = get_mac(gateway_ip, iface=selected_interface)
 
-                self._restore_arp_for_device(target_ip, target_actual_mac, gateway_ip, gateway_actual_mac, selected_interface)
+                self._restore_arp_for_device(target_ip, target_actual_mac, gateway_ip, gateway_actual_mac,
+                                             selected_interface)
                 time.sleep(0.5)
 
             self.gui_log_output("All blocking operations stopped and devices should now be unblocked.", "green")
@@ -1455,7 +1536,8 @@ class NetworkToolGUI:
             my_ip, _, _ = self._get_interface_details_for_selected()
             if not my_ip:
                 messagebox.showwarning("Cảnh báo", "Không thể lấy địa chỉ IP của bạn. Vui lòng kiểm tra kết nối mạng.")
-                self.gui_log_output("Cannot start bandwidth monitor: Local IP not determined for selected interface.", "yellow")
+                self.gui_log_output("Cannot start bandwidth monitor: Local IP not determined for selected interface.",
+                                    "yellow")
                 return
 
             if not self.bandwidth_display_labels:
@@ -1477,7 +1559,8 @@ class NetworkToolGUI:
             self.bandwidth_thread.start()
             self.bandwidth_update_job_id = self.root.after(self.bandwidth_monitor_interval_ms,
                                                            self._update_bandwidth_gui)
-            self.root.after(0, lambda: self._set_ui_busy_state(False))  # Release UI busy state, only bandwidth button remains changed
+            self.root.after(0, lambda: self._set_ui_busy_state(
+                False))  # Release UI busy state, only bandwidth button remains changed
         else:
             self._stop_bandwidth_monitor_task()
 
@@ -1743,7 +1826,7 @@ class NetworkToolGUI:
         # Add a disconnect button to the console window itself
         disconnect_btn = ctk.CTkButton(frame, text="Disconnect ESP32", command=self._stop_esp32_connection,
                                        fg_color=self.colors['error'], hover_color=self.colors['error'],
-                                       border_width=0, text_color=self.colors['text']) # Disconnect button is red fill
+                                       border_width=0, text_color=self.colors['text'])  # Disconnect button is red fill
         disconnect_btn.grid(row=1, column=0, pady=(0, 10))
 
         # Update the main GUI button (ensures it shows "Disconnect") - no need to call _set_ui_busy_state here again
@@ -1852,7 +1935,8 @@ class NetworkToolGUI:
                     # No ports found, keep connect button and port dropdown disabled, but refresh is active
                     if hasattr(self, 'btn_esp32_connect'): self.btn_esp32_connect.configure(state="disabled")
                     if hasattr(self, 'esp32_port_optionmenu'): self.esp32_port_optionmenu.configure(state="disabled")
-                    if hasattr(self, 'btn_refresh_esp32_ports'): self.btn_refresh_esp32_ports.configure(state="normal")  # Always allow refreshing ports
+                    if hasattr(self, 'btn_refresh_esp32_ports'): self.btn_refresh_esp32_ports.configure(
+                        state="normal")  # Always allow refreshing ports
 
     def run(self):
         """Starts the main GUI event loop."""
