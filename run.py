@@ -108,7 +108,7 @@ def get_all_active_interfaces_details():
                     interface_details_dict[interface] = details
                     if not primary_interface_name:
                         primary_interface_name = interface
-                    break  # Take the first IPv4 address for simplicity
+                    break  
 
             if not ipv4_found and mac_addr:
                 if interface not in interface_details_dict:  # Only add if not already added with IPv4
