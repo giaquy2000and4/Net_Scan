@@ -8,7 +8,7 @@ if "SSLKEYLOGFILE" in os.environ:
     try:
         del os.environ["SSLKEYLOGFILE"]
     except Exception:
-        pass  # Ignore errors if it's already gone or inaccessible
+        pass  
 # --- END OF FIX ---
 
 os.environ.pop("SSLKEYLOGFILE", None)  # Keep this original line, it's harmless if the above works
